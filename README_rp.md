@@ -167,3 +167,4 @@ Python と uv の連携（プロジェクトを VS Code で開く時）
 - 見つからない時はコマンドパレットで「Python: Select Interpreter」を選び、プロジェクトの .venv/bin/python を指定
 - ターミナルで uv を使う場合は、統合ターミナルを開いて uv コマンドをそのまま実行すればOKです（例: uv sync、uv run）
 
+grep -vE '^\s*($|#)' requirements.txt | xargs -d '\n' uv add
