@@ -1,4 +1,4 @@
-
+# main.py
 # Python 3.11
 # Flet desktop app controlling TI PCA9539PWR via I2C on Raspberry Pi 4B (Debian Trixie).
 # - Uses GPIO4 as input with internal pull-down.
@@ -73,7 +73,6 @@ class PCA9539:
         raise IOError(f"PCA9539 register 0x{reg:02X} verify failed (wrote 0x{value:02X}, read 0x{(last if last is not None else -1):02X})")
 
     def probe(self, retries: int = 3, delay: float = 0.010):
-        # Simple read of Input_0 to confirm device ACK
         last_exc = None
         for _ in range(retries):
             try:
@@ -85,7 +84,7 @@ class PCA9539:
         raise IOError(f"PCA9539 at 0x{self.addr:02X} not responding") from last_exc
 
     def init_safe(self):
-        # Recommended safe sequence:
+        # Safe sequence:
         # 1) Polarity = 0x00/0x00 (no inversion)
         # 2) Output Port = 0x00/0x00 (desired initial output level)
         # 3) Configuration = 0x00/0x00 (set all as output)
@@ -98,7 +97,6 @@ class PCA9539:
         self._write_and_verify(REG_CONFIG_1, 0x00)
 
     def set_outputs(self, port0_value: int, port1_value: int, verify: bool = False):
-        # Write both output registers
         self._write_reg(REG_OUTPUT_0, port0_value)
         self._write_reg(REG_OUTPUT_1, port1_value)
         if verify:
@@ -132,15 +130,54 @@ def main(page: ft.Page):
     gpio15_label = ft.Text(value="GPIO15: Low")
     i2c_status = ft.Text(value="I2C: Not initialized")
 
+    # pubsub handler (runs on UI thread)
+    def on_msg(msg):
+        t = msg.get("type")
+        if t == "log":
+            info_text.value = msg.get("text", "")
+            page.update()
+        elif t == "gpio":
+            if "gpio4" in msg:
+                gpio4_label.value = f"GPIO4: {'High' if msg['gpio4'] else 'Low'}"
+            if "gpio15" in msg:
+                gpio15_label.value = f"GPIO15: {'High' if msg['gpio15'] else 'Low'}"
+            page.update()
+        elif t == "enable_switches":
+            enable = bool(msg.get("enable", False))
+            for sw in switches:
+                sw.disabled = not enable
+            page.update()
+        elif t == "i2c_status":
+            i2c_status.value = msg.get("text", "")
+            page.update()
+
+    page.pubsub.subscribe(on_msg)
+
+    # Helpers for background thread to request UI updates
+    def log(msg: str):
+        page.pubsub.send_all({"type": "log", "text": msg})
+
+    def set_gpio_labels(gpio4_high=None, gpio15_high=None):
+        payload = {"type": "gpio"}
+        if gpio4_high is not None:
+            payload["gpio4"] = bool(gpio4_high)
+        if gpio15_high is not None:
+            payload["gpio15"] = bool(gpio15_high)
+        page.pubsub.send_all(payload)
+
+    def enable_switches(enable: bool):
+        page.pubsub.send_all({"type": "enable_switches", "enable": bool(enable)})
+
+    def set_i2c_status(text: str):
+        page.pubsub.send_all({"type": "i2c_status", "text": text})
+
     # Build 16 CupertinoSwitches in 4x4 grid
     switches = []
 
     def make_switch(cell_index: int) -> Tuple[ft.Container, ft.CupertinoSwitch]:
-        # cell_index: 1..16
         i = cell_index - 1
         label = f"Cell {cell_index:02d}"
         sw = ft.CupertinoSwitch(value=False, on_change=None)
-        # Store mapping info: (port, bit)
         if i < 8:
             mapping = ("P0", i)  # P00..P07
         else:
@@ -150,12 +187,11 @@ def main(page: ft.Page):
 
         def on_switch_change(e: ft.ControlEvent):
             if not state["i2c_ready"]:
-                # Should be disabled, but guard anyway
+                # Guard
                 sw.value = not sw.value
                 page.update()
                 return
             port, bit = sw.data
-            # Update shadow registers
             if port == "P0":
                 if sw.value:
                     state["port0"] |= (1 << bit)
@@ -166,15 +202,12 @@ def main(page: ft.Page):
                     state["port1"] |= (1 << bit)
                 else:
                     state["port1"] &= ~(1 << bit)
-
-            # Write to device with error handling
             try:
                 state["pca"].set_outputs(state["port0"], state["port1"])
                 i2c_status.value = f"I2C OK: OUT0=0x{state['port0']:02X}, OUT1=0x{state['port1']:02X}"
             except Exception as ex:
-                # Rollback UI state on failure
+                # Rollback
                 if port == "P0":
-                    # revert bit
                     if sw.value:
                         state["port0"] &= ~(1 << bit)
                     else:
@@ -231,54 +264,20 @@ def main(page: ft.Page):
         )
     )
 
-    def log(msg: str):
-        def _update():
-            info_text.value = msg
-            page.update()
-        page.invoke_later(_update)
-
-    def set_gpio_labels(gpio4_high: Optional[bool] = None, gpio15_high: Optional[bool] = None):
-        def _update():
-            if gpio4_high is not None:
-                gpio4_label.value = f"GPIO4: {'High' if gpio4_high else 'Low'}"
-            if gpio15_high is not None:
-                gpio15_label.value = f"GPIO15: {'High' if gpio15_high else 'Low'}"
-            page.update()
-        page.invoke_later(_update)
-
-    def enable_switches(enable: bool):
-        def _update():
-            for sw in switches:
-                sw.disabled = not enable
-            page.update()
-        page.invoke_later(_update)
-
-    def set_i2c_status(text: str):
-        def _update():
-            i2c_status.value = text
-            page.update()
-        page.invoke_later(_update)
-
     # Hardware thread
     def hw_worker():
         try:
             GPIO.setwarnings(False)
             GPIO.setmode(GPIO.BCM)
-            # GPIO4 as input with internal pulldown
             GPIO.setup(GPIO_IN_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-            # GPIO15 as output, initial Low (hold PCA9539 in reset)
             GPIO.setup(GPIO_RST_PIN, GPIO.OUT, initial=GPIO.LOW)
 
-            # Initial labels
             set_gpio_labels(GPIO.input(GPIO_IN_PIN), GPIO.input(GPIO_RST_PIN))
             log("GPIO initialized. Waiting for GPIO4 High to release reset...")
 
-            # Monitor GPIO4; when High, after 100ms set GPIO15 High; then after 100ms start I2C.
             released = False
             i2c_inited = False
-            last_gpio4 = GPIO.input(GPIO_IN_PIN)
-            # If already high at start, treat as event immediately
-            if last_gpio4 and not released:
+            if GPIO.input(GPIO_IN_PIN) and not released:
                 time.sleep(DELAY_AFTER_GPIO4_HIGH_TO_RST_HIGH)
                 GPIO.output(GPIO_RST_PIN, GPIO.HIGH)
                 set_gpio_labels(gpio15_high=True)
@@ -286,7 +285,6 @@ def main(page: ft.Page):
                 log("GPIO4 already High at start. Reset released (GPIO15 High).")
 
                 time.sleep(DELAY_AFTER_RST_HIGH_TO_I2C)
-                # Init I2C
                 try:
                     state["bus"] = SMBus(I2C_BUS_ID)
                 except Exception as bex:
@@ -296,7 +294,6 @@ def main(page: ft.Page):
                 if state["bus"] is not None:
                     try:
                         state["pca"] = PCA9539(state["bus"], PCA9539_ADDR, state["lock"])
-                        # Safe init sequence with verify
                         state["pca"].init_safe()
                         state["i2c_ready"] = True
                         i2c_inited = True
@@ -307,13 +304,11 @@ def main(page: ft.Page):
                         set_i2c_status(f"I2C init failed: {iex}")
                         log(f"PCA9539 init failed: {iex}")
 
-            # Main polling loop for GPIO level display and release sequence
             while not state["stop_event"].is_set():
                 cur_gpio4 = GPIO.input(GPIO_IN_PIN)
                 cur_gpio15 = GPIO.input(GPIO_RST_PIN)
                 set_gpio_labels(gpio4_high=cur_gpio4, gpio15_high=cur_gpio15)
 
-                # Detect rising edge on GPIO4 for reset release if not done
                 if (not released) and cur_gpio4:
                     time.sleep(DELAY_AFTER_GPIO4_HIGH_TO_RST_HIGH)
                     GPIO.output(GPIO_RST_PIN, GPIO.HIGH)
@@ -321,10 +316,8 @@ def main(page: ft.Page):
                     released = True
                     log("GPIO4 High detected. Reset released (GPIO15 High).")
 
-                # After reset released, initialize I2C once
                 if released and (not i2c_inited):
                     time.sleep(DELAY_AFTER_RST_HIGH_TO_I2C)
-                    # Open bus and init PCA9539
                     if state["bus"] is None:
                         try:
                             state["bus"] = SMBus(I2C_BUS_ID)
@@ -349,26 +342,23 @@ def main(page: ft.Page):
         except Exception as ex:
             log(f"HW thread error: {ex}")
         finally:
-            # Nothing to clean here; cleanup on page close
+            # Cleanup is handled on page close
             pass
 
     worker_thread = threading.Thread(target=hw_worker, daemon=True)
     worker_thread.start()
 
     def on_close(e):
-        # Stop worker
         state["stop_event"].set()
         try:
             worker_thread.join(timeout=1.0)
         except Exception:
             pass
-        # Cleanup I2C
         try:
             if state["bus"] is not None:
                 state["bus"].close()
         except Exception:
             pass
-        # Cleanup GPIO
         try:
             GPIO.cleanup()
         except Exception:
