@@ -102,7 +102,7 @@ except Exception as e:
 
 
 ## uvを使った環境構築
-手順A: uv が管理する Python 3.11 を使う（最も簡単、安全）
+
 1) uv をインストール
 - curl -Ls https://astral.sh/uv/install.sh | sh
 - PATH 追加（必要なら）
@@ -115,48 +115,55 @@ except Exception as e:
 
 3) プロジェクト用の仮想環境を Python 3.11 で作成
 - 任意のプロジェクトフォルダで:
-  - uv venv -p 3.11 .venv
-  - source .venv/bin/activate
-  - python -V で 3.11 系であることを確認
+  - uv init
+  - uv sync
 
 4) パッケージ管理（uv を pip 互換で使用）
 - 例: uv pip install requests
 - 速度が非常に速く、依存解決も安定しています。
 - 既存の requirements.txt があれば: uv pip install -r requirements.txt
 
-5) 実行時に常に 3.11 を使いたい場合
-- 仮想環境内であれば python は 3.11 を指します。
-- 仮想環境なしで一発実行したいときは: uv run --python 3.11 your_script.py
-- バージョン確認: uv run --python 3.11 -c "import sys; print(sys.version)"
 
 補足（プロジェクト設定で 3.11 を要求する）
-- pyproject.toml に requires-python = ">=3.11,<3.12" を書くと、uv はその範囲に合う Python（3.11）を選びます。これによりチーム全体でのバージョン統一が容易になります。
+- pyproject.toml に requires-python = ">=3.11, <3.12" を書くと、uv はその範囲に合う Python（3.11）を選びます。これによりチーム全体でのバージョン統一が容易になります。
 
-手順B: apt で Python 3.11 を導入し、それを uv から使う（Pi OS bookworm なら可）
-- まずリポジトリに 3.11 があるか確認: apt policy python3.11
-- あれば:
-  - sudo apt update
-  - sudo apt install -y python3.11 python3.11-venv
-- その後、uv でこの Python を指定して仮想環境作成:
-  - uv venv --python /usr/bin/python3.11 .venv
-  - source .venv/bin/activate
-  - python -V で確認
-- 注意: システムの /usr/bin/python3 のデフォルト切り替えは推奨しません（OS を壊す可能性があるため）。プロジェクトごとに仮想環境を使ってください。
-
-
-運用のヒント
-- 3.13 と 3.11 は共存可能です。プロジェクトごとの .venv を分け、uv pip 経由で依存を管理すると安全です。
-- uv は requirements.txt でも pyproject.toml でも扱えます。移行は容易です。
-- ディスク使用量の目安: uv 管理 Python は 100MB 前後、仮想環境は数十MB。空き容量を確保してください。
-- 32bit Raspberry Pi OS の場合は uv による事前ビルド Python の自動取得が使えないことがあります。その場合は手順BまたはCを選んでください。
 
 最短クイックスタート（64bit Pi OS 前提）
 - curl -Ls https://astral.sh/uv/install.sh | sh
 - echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && exec $SHELL
-- mkdir myproj && cd myproj
-- uv venv -p 3.11 .venv
-- source .venv/bin/activate
-- python -V
-- uv pip install requests
+- mkdir RFID && cd RFID
+- uv init
+- uv sync
+- uv pip install -r requirements.txt
 
-これで、Python 3.13 はそのまま置いたまま、Python 3.11 環境を uv で快適に使えるようになります。必要なら、環境に合わせた（apt またはソース）代替手順も選べます。
+
+## VSCodeのインストール
+Microsoft 公式リポジトリからインストール
+- 事前確認
+  - uname -m で aarch64 であることを確認
+  - sudo apt update でパッケージ情報を最新化
+
+- リポジトリ追加とインストール
+  - sudo apt install -y wget gpg apt-transport-https
+  - wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /usr/share/keyrings/packages.microsoft.gpg > /dev/null
+  - echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main' | sudo tee /etc/apt/sources.list.d/vscode.list
+  - sudo apt update
+  - sudo apt install -y code
+
+- 起動
+  - メニューから「Visual Studio Code」
+  - もしくはターミナルで code
+
+トラブル対処のヒント
+- 画面が真っ黒・クラッシュする場合
+  - code --disable-gpu で起動してみる（GPU ドライバ相性回避）
+- 日本語フォントが欠ける場合
+  - sudo apt install -y fonts-noto-cjk fonts-noto-color-emoji
+- 自動更新
+  - sudo apt update && sudo apt upgrade で更新できます
+
+Python と uv の連携（プロジェクトを VS Code で開く時）
+- ワークスペースに .venv がある場合、VS Code の「Python」拡張が自動で検出します
+- 見つからない時はコマンドパレットで「Python: Select Interpreter」を選び、プロジェクトの .venv/bin/python を指定
+- ターミナルで uv を使う場合は、統合ターミナルを開いて uv コマンドをそのまま実行すればOKです（例: uv sync、uv run）
+
