@@ -671,5 +671,15 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    # Desktop app
+    try:
+        # このファイルの場所: /home/pi/RFID/src/battery/main_rp.py
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))  # -> /home/pi/RFID
+        os.chdir(project_root)
+        logging.info(f"Changed working directory to {project_root}")
+    except Exception as e:
+        logging.error(f"Failed to change working directory: {e}")
+
+    # デスクトップアプリ起動（画像はファイル名のみで参照、assets_dir は相対パス指定）
     ft.app(target=main, assets_dir="src/battery/img", view=ft.AppView.FLET_APP)
+
