@@ -173,7 +173,7 @@ class SPIWorker:
         self.ctrl = None
 
     async def start(self):
-        self._stop_event.clear()
+        self._stop_event.clear
         self._task = asyncio.create_task(self._run())
 
     async def stop(self):
@@ -271,6 +271,7 @@ async def main(page: ft.Page):
     # Init GPIOs
     if GPIO is None:
         raise RuntimeError("RPi.GPIO not available. Install RPi.GPIO and run on Raspberry Pi.")
+    GPIO.setwarnings(False)  # suppress "channel already in use" warnings
     GPIO.setmode(GPIO.BCM)
     # GPIO4 input with pulldown
     GPIO.setup(4, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
@@ -563,7 +564,7 @@ async def main(page: ft.Page):
             update_lower_texts()
             page.update()
 
-    hot_reset_btn.on_click = lambda e: page.run_task(hot_reset_clicked(e))
+    hot_reset_btn.on_click = lambda e: page.run_task(hot_reset_clicked, e)
 
     # ===== Play / Stop handlers =====
     async def on_play(e):
@@ -579,8 +580,8 @@ async def main(page: ft.Page):
         play_btn.disabled = False
         page.update()
 
-    play_btn.on_click = lambda e: page.run_task(on_play(e))
-    stop_btn.on_click = lambda e: page.run_task(on_stop(e))
+    play_btn.on_click = lambda e: page.run_task(on_play, e)
+    stop_btn.on_click = lambda e: page.run_task(on_stop, e)
 
     # Initialize lower texts with current states
     try:
@@ -594,8 +595,8 @@ async def main(page: ft.Page):
     update_lower_texts()
     page.update()
 
-    # Start GPIO monitor
-    page.run_task(monitor_gpio_task())
+    # Start GPIO monitor (pass coroutine function, not coroutine object)
+    page.run_task(monitor_gpio_task)
 
 
 if __name__ == "__main__":
