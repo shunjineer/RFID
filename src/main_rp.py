@@ -9,8 +9,7 @@
 # - "Play" starts periodic (500 ms) SPI reads from MR793200 USER memory via mr793200_controller
 # - "Stop" stops SPI task; on stop, always: GPIO.cleanup(27) then SPI close()
 # - Middle UI: 2 rows x 8 columns (No.1~16), shows light_on/off and temperature over battery.png (180x180)
-# - Lower UI: status panels per spec
-# - PCA9539 outputs (P00..P07 => No.1..No.8, P10..P17 => No.9..No.16) are driven based on On/Off state read from MR793200
+# - Lower UI: status panels per spec; Expanded is not used — fixed widths ensure equal sizes
 
 import asyncio
 import sys
@@ -118,7 +117,7 @@ def parse_user_words(words: List[int]) -> List[Tuple[int, int]]:
     words: 9 words [0]=0x22, [1]=0x24, ... [8]=0x32
     Returns list of 16 tuples: (on_off, temp) for No.1..No.16
     on_off: 0 or 1
-    temp: integer (8-bit) in decimal
+    temp: integer in decimal
     """
     w = words  # alias
     res = []
@@ -361,9 +360,14 @@ async def main(page: ft.Page):
     row1 = ft.Row(controls=tiles[0:8], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
     row2 = ft.Row(controls=tiles[8:16], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
 
-    # Lower: Status sections
-    label_style = dict(bgcolor=ft.Colors.GREY_300, padding=8, border=tile_border)
-    info_style = dict(bgcolor=ft.Colors.GREY_50, padding=8, border=tile_border)
+    # Lower: Status sections (no Expanded)
+    # Fixed widths/heights to ensure equal sizes across rows.
+    label_w = 180
+    info_w = 900
+    box_h = 48
+
+    label_style = dict(bgcolor=ft.Colors.GREY_300, padding=8, border=tile_border, width=label_w, height=box_h)
+    info_style = dict(bgcolor=ft.Colors.GREY_50, padding=8, border=tile_border, width=info_w, height=box_h)
 
     i2c_status_label = ft.Container(content=ft.Text("I2C Status", weight=ft.FontWeight.W_600), **label_style)
     i2c_info_text = ft.Text("Not initialized.")
@@ -381,8 +385,9 @@ async def main(page: ft.Page):
     hot_reset_btn = ft.ElevatedButton(text="Hot Reset")
 
     def make_status_row(left: ft.Control, right: ft.Control):
+        # No Expanded used; left/right containers already have fixed width/height.
         return ft.Row(
-            controls=[ft.Expanded(left, flex=1), ft.Expanded(right, flex=3)],
+            controls=[left, right],
             alignment=ft.MainAxisAlignment.START,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             spacing=8,
