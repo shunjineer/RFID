@@ -418,7 +418,7 @@ async def main(page: ft.Page):
         for idx, st in enumerate(states):
             lights[idx].src = "light_on.png" if st["on"] else "light_off.png"
             temps[idx].value = f"{st['temp']} °C"
-        await page.update_async()
+        page.update()
 
     def update_lower_texts():
         v = vdet_state["value"]
@@ -473,7 +473,7 @@ async def main(page: ft.Page):
             i2c_initialized["value"] = False
         finally:
             update_lower_texts()
-            await page.update_async()
+            page.update()
 
     # ===== GPIO monitoring and control (VDET/RESET) =====
     async def monitor_gpio_task():
@@ -500,7 +500,7 @@ async def main(page: ft.Page):
                                 GPIO.output(15, GPIO.HIGH)
                                 reset_state["value"] = True
                                 update_lower_texts()
-                                await page.update_async()
+                                page.update()
                                 # After 100 ms, start I2C init
                                 await asyncio.sleep(0.1)
                                 await init_i2c_if_ready()
@@ -523,14 +523,14 @@ async def main(page: ft.Page):
                     i2c_initialized["value"] = False
 
                 update_lower_texts()
-                await page.update_async()
+                page.update()
 
             await asyncio.sleep(0.5)  # 500 ms polling
 
     # ===== Hot Reset handler =====
     async def hot_reset_clicked(e):
         hot_reset_msg.value = ""
-        await page.update_async()
+        page.update()
 
         v = vdet_state["value"]
         if v:
@@ -539,14 +539,14 @@ async def main(page: ft.Page):
                 GPIO.output(15, GPIO.LOW)
                 reset_state["value"] = False
                 update_lower_texts()
-                await page.update_async()
+                page.update()
 
                 await asyncio.sleep(0.5)
 
                 GPIO.output(15, GPIO.HIGH)
                 reset_state["value"] = True
                 update_lower_texts()
-                await page.update_async()
+                page.update()
 
                 await asyncio.sleep(0.1)
                 await init_i2c_if_ready()
@@ -561,7 +561,7 @@ async def main(page: ft.Page):
             reset_state["value"] = False
             hot_reset_msg.value = 'Available when VDET is "High."'
             update_lower_texts()
-            await page.update_async()
+            page.update()
 
     hot_reset_btn.on_click = lambda e: page.run_task(hot_reset_clicked(e))
 
@@ -569,15 +569,15 @@ async def main(page: ft.Page):
     async def on_play(e):
         play_btn.disabled = True
         stop_btn.disabled = False
-        await page.update_async()
+        page.update()
         await spi_worker.start()
 
     async def on_stop(e):
         stop_btn.disabled = True
-        await page.update_async()
+        page.update()
         await spi_worker.stop()
         play_btn.disabled = False
-        await page.update_async()
+        page.update()
 
     play_btn.on_click = lambda e: page.run_task(on_play(e))
     stop_btn.on_click = lambda e: page.run_task(on_stop(e))
@@ -592,7 +592,7 @@ async def main(page: ft.Page):
     except Exception:
         reset_state["value"] = False
     update_lower_texts()
-    await page.update_async()
+    page.update()
 
     # Start GPIO monitor
     page.run_task(monitor_gpio_task())
