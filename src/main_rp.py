@@ -22,6 +22,8 @@ import RPi.GPIO as GPIO
 
 # I2C (smbus2)
 from smbus2 import SMBus, i2c_msg
+import atexit
+import signal
 
 # SPI MR793200 controller import (add src/mr793200 to sys.path)
 _THIS_DIR = os.path.dirname(__file__)
@@ -389,6 +391,45 @@ def main(page: ft.Page):
     setup_gpio()
     i2c = PCA9539(bus_id=1, addr=PCA9539_ADDR)
 
+    # I2C cleanup
+    def perform_i2c_shutdown():
+        try:
+            if i2c is not None:
+                i2c.close()  # 例外が起きても内部で try/except 済み
+                logging.info("I2C bus closed on shutdown.")
+        except Exception as e:
+            logging.error(f"I2C shutdown failed: {e}")
+
+    # 終了時（プロセス終了時）に必ず実行
+    atexit.register(perform_i2c_shutdown)
+
+    # Ctrl+C や systemd 停止などのシグナルでも実行
+    def _sig_handler(signum, frame):
+        logging.info(f"Signal received ({signum}); cleaning up I2C...")
+        perform_i2c_shutdown()
+    try:
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+    except Exception as e:
+        # 一部の環境（スレッド内など）で signal 登録が不可の場合があるため
+        logging.warning(f"Signal handlers not set: {e}")
+
+    # Flet ウィンドウのクローズ/切断イベントでも実行
+    def _on_close_or_disconnect(e=None):
+        logging.info("Window closing/disconnecting; cleaning up I2C...")
+        perform_i2c_shutdown()
+
+    # Flet 0.28.3 で利用可能なイベントに両方バインド（片方だけでも可）
+    try:
+        page.on_close = _on_close_or_disconnect
+    except Exception:
+        pass
+    try:
+        page.on_disconnect = _on_close_or_disconnect
+    except Exception:
+        pass
+
+
     spi_stop_event: asyncio.Event | None = None
     spi_task_running = False
 
@@ -480,7 +521,7 @@ def main(page: ft.Page):
     def reset_middle_to_initial():
         # Set all light off and temp "-°C"
         for i in range(16):
-            middle_cells[i]["light_img"].src = "light_off.png"
+            middle_cells[i]["light_img"].src_base64 = IMG_B64["light_off.png"]
             middle_cells[i]["temp_text"].value = "-°C"
 
     def on_stop_click(e: ft.ControlEvent):
