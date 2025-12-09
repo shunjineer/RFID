@@ -32,20 +32,28 @@ if _MR793200_DIR not in sys.path:
 
 from mr793200_controller import mr793200_controller
 
-# assets_dir の堅牢化(相対→絶対フォールバック)
-_ASSETS_REL = "src/battery/img"
-_ASSETS_ABS = os.path.abspath(os.path.join(_PROJECT_SRC_DIR, "battery", "img"))
-def _resolve_assets_dir() -> str:
-    # まず仕様どおり相対パスを優先
-    rel_path = os.path.abspath(os.path.join(os.getcwd(), _ASSETS_REL))
-    if os.path.isdir(rel_path):
-        return _ASSETS_REL  # Flet に相対で渡しても可
-    # 相対が解決できないときは絶対パスを渡す
-    if os.path.isdir(_ASSETS_ABS):
-        return _ASSETS_ABS
-    # どちらも存在しない場合はログ出して相対を返す（Flet 側で 404 を出す）
-    logging.error(f"Assets directory not found: {_ASSETS_REL} or {_ASSETS_ABS}")
-    return _ASSETS_REL
+import base64
+from pathlib import Path
+
+# 画像ディレクトリ
+IMG_DIR = Path(__file__).resolve().parent / "img"  # -> /home/pi/RFID/src/battery/img
+
+def _load_image_b64(filename: str) -> str:
+    """assets_dir を使わずにローカルファイルから base64 を生成"""
+    try:
+        p = IMG_DIR / filename
+        with open(p, "rb") as f:
+            return base64.b64encode(f.read()).decode("ascii")
+    except Exception as e:
+        logging.error(f"Failed to load image file '{filename}': {e}")
+        return ""  # 空文字でも Image は作成可能
+
+# 起動時に読み込んでキャッシュ（IOは try/except 付き）
+IMG_B64 = {
+    "battery.png": _load_image_b64("battery.png"),
+    "light_on.png": _load_image_b64("light_on.png"),
+    "light_off.png": _load_image_b64("light_off.png"),
+}
 
 # Logging setup
 logging.basicConfig(
@@ -74,6 +82,7 @@ USER_ADDRS = [0x22, 0x24, 0x26, 0x28, 0x2A, 0x2C, 0x2E, 0x30, 0x32]
 
 
 def setup_gpio():
+    GPIO.setwarnings(False) 
     try:
         GPIO.setmode(GPIO.BCM)
         # VDET: input with pull-down
@@ -318,10 +327,10 @@ def build_middle_cells():
     for idx in range(16):
         no_text = ft.Text(f"No. {idx + 1}", weight=ft.FontWeight.BOLD)
 
-        light_img = ft.Image(src="light_off.png", width=180, height=180, fit=ft.ImageFit.CONTAIN)
+        light_img = ft.Image(src_base64=IMG_B64["light_off.png"], width=150, height=150, fit=ft.ImageFit.CONTAIN)
 
         temp_text = ft.Text("-°C", size=20, weight=ft.FontWeight.W_600, color=ft.Colors.BLACK, text_align=ft.TextAlign.CENTER)
-        battery_img = ft.Image(src="battery.png", width=180, height=180, fit=ft.ImageFit.CONTAIN)
+        battery_img = ft.Image(src_base64=IMG_B64["battery.png"], width=150, height=150, fit=ft.ImageFit.CONTAIN)
         temp_stack = ft.Stack(
             controls=[battery_img, temp_text],
             alignment=ft.alignment.center,
@@ -431,9 +440,9 @@ def main(page: ft.Page):
                     for i in range(16):
                         # Light on/off
                         if (on_mask >> i) & 1:
-                            middle_cells[i]["light_img"].src = "light_on.png"
+                            middle_cells[i]["light_img"].src_base64 = IMG_B64["light_on.png"]
                         else:
-                            middle_cells[i]["light_img"].src = "light_off.png"
+                            middle_cells[i]["light_img"].src_base64 = IMG_B64["light_off.png"]
                         # Temperature
                         middle_cells[i]["temp_text"].value = temps[i]
 
@@ -685,5 +694,4 @@ def main(page: ft.Page):
 
 if __name__ == "__main__":
     # Desktop app
-    assets_path = _resolve_assets_dir()
-    ft.app(target=main, assets_dir=assets_path, view=ft.AppView.FLET_APP)
+    ft.app(target=main, view=ft.AppView.FLET_APP)
