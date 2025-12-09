@@ -10,6 +10,8 @@
 # - PCA9539PWR(I2C addr 0x74) 初期化と確認、出力制御
 # - MR793200 SPI 読み取り（mr793200_controller）と UI/I2C 反映
 # - 各種 I/O 例外ハンドリングと終了処理の厳守
+# - Play/Stop の非アクティブ時グレーアウト（disabled時はアイコン色をGREY_300に変更）
+# - 画面閉じるボタンで終了時に PCA9539 全出力を Low に確実に設定
 
 import os
 import sys
@@ -22,7 +24,7 @@ import flet as ft
 
 # RPi.GPIO と smbus2 は Raspberry Pi 実機で使用されます
 import RPi.GPIO as GPIO
-from smbus2 import SMBus, i2c_msg
+from smbus2 import SMBus
 
 # mr793200_controller の import（/src/mr793200/ 配下）
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # /src/battery
@@ -105,7 +107,6 @@ class BatteryApp:
         except Exception as e:
             print(f"[ERROR] Image load failed: {path}: {e}")
             traceback.print_exc()
-            # 不測時でもUIが壊れないよう空を返す
             return ""
 
     # ------------------------
@@ -201,11 +202,13 @@ class BatteryApp:
     def i2c_outputs_all_low(self):
         # 終了処理の1) Output Port 0x02/0x03 に 0x00
         try:
-            if self.bus is not None:
-                self._i2c_write_byte(REG_OUTPUT0, 0x00)
-                self._i2c_write_byte(REG_OUTPUT1, 0x00)
-                self.cached_out0 = 0x00
-                self.cached_out1 = 0x00
+            if self.bus is None:
+                # 終了時でも確実に Low を出すため、一時的にオープンして書く
+                self.bus = SMBus(I2C_BUS_NO)
+            self._i2c_write_byte(REG_OUTPUT0, 0x00)
+            self._i2c_write_byte(REG_OUTPUT1, 0x00)
+            self.cached_out0 = 0x00
+            self.cached_out1 = 0x00
         except Exception as e:
             print(f"[ERROR] I2C outputs_all_low failed: {e}")
             traceback.print_exc()
@@ -278,6 +281,8 @@ class BatteryApp:
                         except Exception as e:
                             print(f"[ERROR] GPIO set RESET Low failed: {e}")
                             traceback.print_exc()
+                        # 終了時も含めて安全に Low 出力へ
+                        self.i2c_outputs_all_low()
                         self.i2c_close()
                     last_vdet = vdet
 
@@ -323,45 +328,6 @@ class BatteryApp:
         except Exception as e:
             print(f"[ERROR] Update status texts failed: {e}")
             traceback.print_exc()
-
-    # ------------------------
-    # SPI 読み取りタスク（500ms）
-    # ------------------------
-    async def spi_read_task(self):
-        self.spi_task_running = True
-        try:
-            while self.spi_running:
-                words = {}
-                try:
-                    for addr in USER_ADDRS:
-                        hexstr = self.mr.read_nvm1(0x04, addr, 1)
-                        # '9a8a' のような小文字hex
-                        words[addr] = int(hexstr, 16)
-                except Exception as e:
-                    print(f"[ERROR] SPI read failed: {e}")
-                    traceback.print_exc()
-                    # 継続して再試行
-                    await asyncio.sleep(0.5)
-                    continue
-
-                on_states, temps = self._parse_user_words(words)
-
-                # UI 更新
-                for i in range(16):
-                    # Light on/off
-                    img = self.cells[i]["light_img"]
-                    img.src_base64 = self.light_on_b64 if on_states[i] else self.light_off_b64
-                    # Temp text
-                    ttxt = self.cells[i]["temp_text"]
-                    ttxt.value = f"{temps[i]}°C" if temps[i] is not None else "-°C"
-                self.page.update()
-
-                # I2C 出力反映
-                self.update_pca9539_outputs(on_states)
-
-                await asyncio.sleep(0.5)
-        finally:
-            self.spi_task_running = False
 
     # ------------------------
     # USERメモリパース（On/Off と 温度）
@@ -450,13 +416,27 @@ class BatteryApp:
     # ------------------------
     # Play / Stop / Hot Reset
     # ------------------------
+    def _set_play_state(self, active: bool):
+        # active=True: 押下可能、緑色。active=False: 押下不可、グレーアウト
+        if self.play_btn is None:
+            return
+        self.play_btn.disabled = not active
+        self.play_btn.icon_color = ft.Colors.GREEN_ACCENT_400 if active else ft.Colors.GREY_300
+
+    def _set_stop_state(self, active: bool):
+        # active=True: 押下可能、赤色。active=False: 押下不可、グレーアウト
+        if self.stop_btn is None:
+            return
+        self.stop_btn.disabled = not active
+        self.stop_btn.icon_color = ft.Colors.RED_400 if active else ft.Colors.GREY_300
+
     def on_play(self, e):
-        # Play 押下：Play無効化、Stop有効化、SPI開始
+        # Play 押下：Play無効化（グレーアウト）、Stop有効化、SPI開始
         if self.spi_running:
             return
         # UI
-        self.play_btn.disabled = True
-        self.stop_btn.disabled = False
+        self._set_play_state(active=False)
+        self._set_stop_state(active=True)
         self.page.update()
 
         # SPI開始
@@ -474,8 +454,8 @@ class BatteryApp:
                 print(f"[ERROR] MR793200 init failed: {se}")
                 traceback.print_exc()
                 # 失敗時はボタン状態を元に戻す
-                self.play_btn.disabled = False
-                self.stop_btn.disabled = True
+                self._set_play_state(active=True)
+                self._set_stop_state(active=False)
                 self.page.update()
                 return
 
@@ -487,13 +467,13 @@ class BatteryApp:
             print(f"[ERROR] SPI start failed: {e2}")
             traceback.print_exc()
             # UI戻す
-            self.play_btn.disabled = False
-            self.stop_btn.disabled = True
+            self._set_play_state(active=True)
+            self._set_stop_state(active=False)
             self.page.update()
 
     def on_stop(self, e):
         # Stop 押下：SPI通信の終了処理、UI/出力のリセット
-        self.stop_btn.disabled = True
+        self._set_stop_state(active=False)
         self.page.update()
         # SPI停止と終了処理
         self._spi_cleanup()
@@ -507,8 +487,8 @@ class BatteryApp:
         # PCA9539 を全Low
         self.i2c_outputs_all_low()
 
-        # Play を再度有効化
-        self.play_btn.disabled = False
+        # Play を再度有効化（緑）
+        self._set_play_state(active=True)
         self.page.update()
 
     def _spi_cleanup(self):
@@ -518,11 +498,6 @@ class BatteryApp:
         try:
             # 停止フラグ
             self.spi_running = False
-
-            # タスクの自然終了を待つため少し猶予
-            # （run_taskのコルーチンが次のループで終了）
-            # ここでは同期的に待たずにクリーンアップ続行
-            pass
         except Exception as e:
             print(f"[ERROR] SPI stop flag set failed: {e}")
             traceback.print_exc()
@@ -576,7 +551,6 @@ class BatteryApp:
             print(f"[ERROR] Hot reset sequence failed: {e}")
             traceback.print_exc()
         finally:
-            # メッセージは特に表示しない、必要なら状態は下段で反映
             self._update_status_texts()
             self.page.update()
 
@@ -587,7 +561,7 @@ class BatteryApp:
         # Upper: Play / Stop
         self.play_btn = ft.IconButton(
             icon=ft.Icons.PLAY_CIRCLE_ROUNDED,
-            icon_color=ft.Colors.GREEN_ACCENT_400,
+            icon_color=ft.Colors.GREEN_ACCENT_400,  # 初期値: Activate（緑）
             icon_size=36,
             disabled=False,
             tooltip="Start SPI reading",
@@ -595,18 +569,14 @@ class BatteryApp:
         )
         self.stop_btn = ft.IconButton(
             icon=ft.Icons.STOP_CIRCLE_ROUNDED,
-            icon_color=ft.Colors.RED_400,
+            icon_color=ft.Colors.GREY_300,  # 初期値: Deactivate（グレーアウト）
             icon_size=36,
             disabled=True,
             tooltip="Stop SPI",
             on_click=self.on_stop,
         )
         upper_row = ft.Row([self.play_btn, self.stop_btn], spacing=10)
-
-        upper_container = ft.Container(
-            content=upper_row,
-            padding=10,
-        )
+        upper_container = ft.Container(content=upper_row, padding=10)
 
         # Middle: 2行 x 8列（GridViewは使わない）
         self.cells = []
@@ -708,12 +678,12 @@ class BatteryApp:
         # SPI 停止・終了処理
         self._spi_cleanup()
         # I2C 終了処理（1) 出力全Low -> 2) bus close）
+        # bus が未初期化でも Low を確実に出す
         self.i2c_outputs_all_low()
         self.i2c_close()
         # GPIO4/15 cleanup（個別指定）
         try:
-            # GPIO.cleanup([GPIO_VDET, GPIO_RESET])
-            GPIO.cleanup()
+            GPIO.cleanup([GPIO_VDET, GPIO_RESET])
         except Exception as ex:
             print(f"[ERROR] GPIO cleanup for VDET/RESET failed: {ex}")
             traceback.print_exc()
@@ -745,6 +715,7 @@ def main(page: ft.Page):
 if __name__ == "__main__":
     # flet desktop
     ft.app(target=main, view=ft.AppView.FLET_APP)
+
 
 
 # if __name__ == "__main__":
