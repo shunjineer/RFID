@@ -32,6 +32,20 @@ if _MR793200_DIR not in sys.path:
 
 from mr793200_controller import mr793200_controller
 
+# assets_dir の堅牢化(相対→絶対フォールバック)
+_ASSETS_REL = "src/battery/img"
+_ASSETS_ABS = os.path.abspath(os.path.join(_PROJECT_SRC_DIR, "battery", "img"))
+def _resolve_assets_dir() -> str:
+    # まず仕様どおり相対パスを優先
+    rel_path = os.path.abspath(os.path.join(os.getcwd(), _ASSETS_REL))
+    if os.path.isdir(rel_path):
+        return _ASSETS_REL  # Flet に相対で渡しても可
+    # 相対が解決できないときは絶対パスを渡す
+    if os.path.isdir(_ASSETS_ABS):
+        return _ASSETS_ABS
+    # どちらも存在しない場合はログ出して相対を返す（Flet 側で 404 を出す）
+    logging.error(f"Assets directory not found: {_ASSETS_REL} or {_ASSETS_ABS}")
+    return _ASSETS_REL
 
 # Logging setup
 logging.basicConfig(
@@ -267,20 +281,20 @@ def parse_user_memory(values: Dict[int, int]) -> Tuple[int, List[str]]:
     # temp parts per No., ordered MSB->LSB
     temp_parts = [
         [(0x22, 14, 7)],                                 # No.1: 8 bits
-        [(0x24, 15, 14), (0x22, 5, 0)],                  # No.2: 2 + 6
+        [(0x22, 5, 0), (0x24, 15, 14)],                  # No.2: 2 + 6
         [(0x24, 12, 5)],                                 # No.3: 8 bits
-        [(0x26, 15, 12), (0x24, 3, 0)],                  # No.4: 4 + 4
+        [(0x24, 3, 0), (0x26, 15, 12)],                  # No.4: 4 + 4
         [(0x26, 10, 3)],                                 # No.5: 8 bits
-        [(0x28, 15, 10), (0x26, 1, 0)],                  # No.6: 6 + 2
+        [(0x26, 1, 0), (0x28, 15, 10)],                  # No.6: 6 + 2
         [(0x28, 8, 1)],                                  # No.7: 8 bits
         [(0x2A, 15, 8)],                                 # No.8: 8 bits
-        [(0x2C, 15, 15), (0x2A, 6, 0)],                  # No.9: 1 + 7
+        [(0x2A, 6, 0), (0x2C, 15, 15)],                  # No.9: 1 + 7
         [(0x2C, 13, 6)],                                 # No.10: 8 bits
-        [(0x2E, 15, 13), (0x2C, 4, 0)],                  # No.11: 3 + 5
+        [(0x2C, 4, 0), (0x2E, 15, 13)],                  # No.11: 3 + 5
         [(0x2E, 11, 4)],                                 # No.12: 8 bits
-        [(0x30, 15, 11), (0x2E, 2, 0)],                  # No.13: 5 + 3
+        [(0x2E, 2, 0), (0x30, 15, 11)],                  # No.13: 5 + 3
         [(0x30, 9, 2)],                                  # No.14: 8 bits
-        [(0x32, 15, 9), (0x30, 0, 0)],                   # No.15: 7 + 1
+        [(0x30, 0, 0), (0x32, 15, 9)],                   # No.15: 7 + 1
         [(0x32, 7, 0)],                                  # No.16: 8 bits
     ]
 
@@ -358,10 +372,9 @@ def build_middle_grid(cells):
 
 def main(page: ft.Page):
     page.title = "Battery Monitor"
-    page.window_width = 1920
-    page.window_height = 1080
     page.padding = 12
     page.spacing = 8
+    page.window.maximized = True
 
     # State objects
     setup_gpio()
@@ -671,17 +684,6 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    from pathlib import Path
-
-    try:
-        script_dir = Path(__file__).resolve().parent            # /home/pi/RFID/src/battery
-        project_root = script_dir.parent.parent                  # /home/pi/RFID
-        os.chdir(project_root)
-        logging.info(f"Working directory set to: {project_root}")
-        logging.info(f"Assets path configured: {os.path.abspath('src/battery/img')}")
-    except Exception as e:
-        logging.error(f"Failed to set working directory: {e}")
-
-    # デスクトップアプリ起動（画像はファイル名のみで参照、assets_dir は相対パス指定）
-    ft.app(target=main, assets_dir="src/battery/img", view=ft.AppView.FLET_APP)
-
+    # Desktop app
+    assets_path = _resolve_assets_dir()
+    ft.app(target=main, assets_dir=assets_path, view=ft.AppView.FLET_APP)
