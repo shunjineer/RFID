@@ -1,725 +1,751 @@
 # /src/battery/main_rp.py
-# Python 3.11, Flet 0.28.3
-# Desktop app for Raspberry Pi 4B (Trixie)
-# - SPI: MR793200 (ROHM) via mr793200_controller
-# - I2C: PCA9539PWR (TI) via smbus2 on /dev/i2c-1 (addr 0x74)
-# - GPIO: RPi.GPIO for GPIO4 (input, PUD_DOWN), GPIO15 (output reset), GPIO27 (SPI enable)
-# - Images: base64-loaded PNGs (no assets_dir). Display scaled via Image width/height.
-# - Robust error handling with try/except and terminal logs.
-# - Flet: use Colors and Icons; update UI with page.update(); run tasks with page.run_task.
+# Python 3.11 / Flet 0.28.3
+# Raspberry Pi 4B (Trixie) Desktop アプリ
+# 要件:
+# - Flet Colors/Icons を使用
+# - page.update() のみで画面更新
+# - page.run_task にはコルーチン関数参照を渡す（コルーチンオブジェクトを渡さない）
+# - assets_dir 不使用。画像は base64 で読み込む
+# - RPi.GPIO, smbus2 を使用
+# - PCA9539PWR(I2C addr 0x74) 初期化と確認、出力制御
+# - MR793200 SPI 読み取り（mr793200_controller）と UI/I2C 反映
+# - 各種 I/O 例外ハンドリングと終了処理の厳守
+
+import os
+import sys
 import asyncio
 import base64
-import sys
-import time
-from pathlib import Path
+import traceback
+from typing import List, Dict, Tuple
 
 import flet as ft
+
+# RPi.GPIO と smbus2 は Raspberry Pi 実機で使用されます
 import RPi.GPIO as GPIO
-from smbus2 import SMBus
+from smbus2 import SMBus, i2c_msg
 
-# Import mr793200_controller from /src/mr793200/
-try:
-    THIS_FILE = Path(__file__).resolve()
-    SRC_DIR = THIS_FILE.parent.parent  # /src
-    MR_DIR = SRC_DIR / "mr793200"
-    sys.path.insert(0, str(MR_DIR))
-    from mr793200_controller import mr793200_controller
-except Exception as e:
-    print(f"[IMPORT ERROR] Failed to import mr793200_controller: {e}")
-    raise
+# mr793200_controller の import（/src/mr793200/ 配下）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # /src/battery
+MR_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "mr793200"))
+if MR_DIR not in sys.path:
+    sys.path.append(MR_DIR)
+from mr793200_controller import mr793200_controller
 
 
-# --- Constants ---
-I2C_BUS_NUM = 1              # /dev/i2c-1
+# GPIO 定義（BCM）
+GPIO_VDET = 4    # 物理Pin 7
+GPIO_RESET = 15  # 物理Pin 10
+GPIO_SPI_EN = 27 # 物理Pin 13
+
+# I2C
+I2C_BUS_NO = 1
 PCA9539_ADDR = 0x74
-# PCA9539 Registers
-REG_IN0 = 0x00
-REG_IN1 = 0x01
-REG_OUT0 = 0x02
-REG_OUT1 = 0x03
-REG_POL0 = 0x04
-REG_POL1 = 0x05
-REG_CFG0 = 0x06
-REG_CFG1 = 0x07
+REG_INPUT0 = 0x00
+REG_INPUT1 = 0x01
+REG_OUTPUT0 = 0x02
+REG_OUTPUT1 = 0x03
+REG_POLARITY0 = 0x04
+REG_POLARITY1 = 0x05
+REG_CONFIG0 = 0x06
+REG_CONFIG1 = 0x07
 
-GPIO.setmode(GPIO.BCM)
-GPIO4 = 4   # VDET input (PUD_DOWN)
-GPIO15 = 15 # RESET output
-GPIO27 = 27 # MR793200 control (set High to enable SPI read)
-
-# --- Helpers ---
-def load_image_base64(path: Path) -> str:
-    try:
-        with path.open("rb") as f:
-            return base64.b64encode(f.read()).decode("ascii")
-    except Exception as e:
-        print(f"[IMAGE LOAD ERROR] {path}: {e}")
-        return ""
+# MR793200 USERメモリアドレス群
+USER_ADDRS = [0x22, 0x24, 0x26, 0x28, 0x2A, 0x2C, 0x2E, 0x30, 0x32]
 
 
-def get_bit(val: int, bit: int) -> int:
-    return (val >> bit) & 0x1
+class BatteryApp:
+    def __init__(self, page: ft.Page):
+        self.page = page
 
+        # 画像のbase64文字列（起動時一回読み込み）
+        self.light_on_b64 = self._load_img_b64(os.path.join(BASE_DIR, "img", "light_on.png"))
+        self.light_off_b64 = self._load_img_b64(os.path.join(BASE_DIR, "img", "light_off.png"))
+        self.battery_b64 = self._load_img_b64(os.path.join(BASE_DIR, "img", "battery.png"))
 
-def get_bits(val: int, high: int, low: int) -> int:
-    width = high - low + 1
-    mask = (1 << width) - 1
-    return (val >> low) & mask
-
-
-class I2CManager:
-    def __init__(self):
-        self.bus: SMBus | None = None
-        self.initialized: bool = False
-
-    def open(self):
-        if self.bus is None:
-            try:
-                self.bus = SMBus(I2C_BUS_NUM)
-                print("[I2C] Bus opened.")
-            except Exception as e:
-                print(f"[I2C OPEN ERROR] {e}")
-                self.bus = None
-
-    def close(self):
-        try:
-            if self.bus is not None:
-                self.bus.close()
-                print("[I2C] Bus closed.")
-        except Exception as e:
-            print(f"[I2C CLOSE ERROR] {e}")
-        finally:
-            self.bus = None
-            self.initialized = False
-
-    def init_pca9539(self) -> bool:
-        # Initialize PCA9539: CFG=0x00 (outputs), POL=0x00 (normal), OUT=0x00 (all Low)
-        self.open()
-        if self.bus is None:
-            print("[I2C INIT ERROR] Bus not available.")
-            self.initialized = False
-            return False
-        ok = True
-        try:
-            self.bus.write_byte_data(PCA9539_ADDR, REG_CFG0, 0x00)
-            self.bus.write_byte_data(PCA9539_ADDR, REG_CFG1, 0x00)
-            self.bus.write_byte_data(PCA9539_ADDR, REG_POL0, 0x00)
-            self.bus.write_byte_data(PCA9539_ADDR, REG_POL1, 0x00)
-            self.bus.write_byte_data(PCA9539_ADDR, REG_OUT0, 0x00)
-            self.bus.write_byte_data(PCA9539_ADDR, REG_OUT1, 0x00)
-
-            # Read-back verification
-            cfg0 = self.bus.read_byte_data(PCA9539_ADDR, REG_CFG0)
-            cfg1 = self.bus.read_byte_data(PCA9539_ADDR, REG_CFG1)
-            pol0 = self.bus.read_byte_data(PCA9539_ADDR, REG_POL0)
-            pol1 = self.bus.read_byte_data(PCA9539_ADDR, REG_POL1)
-            out0 = self.bus.read_byte_data(PCA9539_ADDR, REG_OUT0)
-            out1 = self.bus.read_byte_data(PCA9539_ADDR, REG_OUT1)
-
-            if (cfg0, cfg1, pol0, pol1, out0, out1) != (0x00, 0x00, 0x00, 0x00, 0x00, 0x00):
-                ok = False
-                print(f"[I2C INIT VERIFY ERROR] Read-back mismatch: "
-                      f"CFG0={cfg0:#04x}, CFG1={cfg1:#04x}, POL0={pol0:#04x}, POL1={pol1:#04x}, OUT0={out0:#04x}, OUT1={out1:#04x}")
-            else:
-                print("[I2C INIT] PCA9539 configured successfully.")
-        except Exception as e:
-            ok = False
-            print(f"[I2C INIT ERROR] {e}")
-
-        self.initialized = ok
-        return ok
-
-    def write_outputs(self, port0_val: int, port1_val: int):
-        if self.bus is None or not self.initialized:
-            print("[I2C WRITE] Bus not initialized.")
-            return
-        try:
-            self.bus.write_byte_data(PCA9539_ADDR, REG_OUT0, port0_val & 0xFF)
-            self.bus.write_byte_data(PCA9539_ADDR, REG_OUT1, port1_val & 0xFF)
-        except Exception as e:
-            print(f"[I2C WRITE ERROR] {e}")
-
-
-class AppState:
-    def __init__(self):
-        # GPIO runtime state
-        self.vdet_high: bool | None = None  # None unknown, True high, False low
-        self.reset_high: bool | None = None
-
-        # Image base64
-        base_dir = Path(__file__).resolve().parent / "img"
-        self.img_light_on_b64 = load_image_base64(base_dir / "light_on.png")
-        self.img_light_off_b64 = load_image_base64(base_dir / "light_off.png")
-        self.img_battery_b64 = load_image_base64(base_dir / "battery.png")
-
-        # I2C
-        self.i2c = I2CManager()
-
-        # SPI
-        self.spi_ctrl: mr793200_controller | None = None
-        self.spi_running: bool = False
-        self.spi_stop_requested: bool = False
-
-        # Tasks control
-        self.vdet_task_running: bool = True
-
-        # UI references
+        # UI部品保持
         self.play_btn: ft.IconButton | None = None
         self.stop_btn: ft.IconButton | None = None
-        self.no_tiles: list[dict] = []  # [{container, label, light_img, batt_stack, temp_text}]
-        self.i2c_info_text: ft.Text | None = None
-        self.vdet_info_text: ft.Text | None = None
-        self.reset_info_text: ft.Text | None = None
-        self.hot_reset_warn: ft.Text | None = None
 
+        # 16個のセル（No.1～No.16）
+        self.cells: List[Dict] = []
 
-def setup_gpio_initial():
-    # GPIO4: input with internal pull-down; GPIO15: output Low; GPIO27 not set yet.
-    try:
-        GPIO.setup(GPIO4, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-        print("[GPIO] GPIO4 set as INPUT with PUD_DOWN.")
-    except Exception as e:
-        print(f"[GPIO SETUP ERROR] GPIO4: {e}")
-    try:
-        GPIO.setup(GPIO15, GPIO.OUT, initial=GPIO.LOW)
-        print("[GPIO] GPIO15 set as OUTPUT, initial LOW.")
-    except Exception as e:
-        print(f"[GPIO SETUP ERROR] GPIO15: {e}")
+        # Lower 情報表示
+        self.i2c_info_text = ft.Text("-", color=ft.Colors.BLACK, size=14)
+        self.vdet_info_text = ft.Text("-", color=ft.Colors.BLACK, size=14)
+        self.reset_info_text = ft.Text("-", color=ft.Colors.BLACK, size=14)
+        self.hot_reset_msg = ft.Text("", color=ft.Colors.RED, size=14)
 
+        # 状態
+        self.app_running = True
 
-def gpio_cleanup_on_exit():
-    # I2C close and GPIO cleanup for GPIO4 and GPIO15 at app exit
-    try:
-        GPIO.cleanup(GPIO4)
-        print("[GPIO] GPIO4 cleaned up.")
-    except Exception as e:
-        print(f"[GPIO CLEANUP ERROR] GPIO4: {e}")
-    try:
-        GPIO.cleanup(GPIO15)
-        print("[GPIO] GPIO15 cleaned up.")
-    except Exception as e:
-        print(f"[GPIO CLEANUP ERROR] GPIO15: {e}")
+        # I2C
+        self.bus: SMBus | None = None
+        self.i2c_ready = False
+        self.cached_out0 = 0x00
+        self.cached_out1 = 0x00
 
+        # SPI / MR793200
+        self.mr: mr793200_controller | None = None
+        self.spi_running = False
 
-def build_no_tile(state: AppState, idx: int) -> ft.Container:
-    # idx: 1..16
-    title = ft.Text(f"No. {idx}", weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK)
-    light_img = ft.Image(
-        src_base64=state.img_light_off_b64,
-        width=180,
-        height=180,
-        fit=ft.ImageFit.CONTAIN,
-    )
-    temp_text = ft.Text("-°C", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.BLACK)
-    batt_img = ft.Image(
-        src_base64=state.img_battery_b64,
-        width=180,
-        height=180,
-        fit=ft.ImageFit.CONTAIN,
-    )
-    batt_stack = ft.Stack(
-        controls=[batt_img, temp_text],
-        alignment=ft.alignment.center,
-        width=180,
-        height=180,
-    )
-    content = ft.Column(controls=[title, light_img, batt_stack], spacing=6, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
-    tile = ft.Container(
-        content=content,
-        border=ft.border.all(1, ft.Colors.GREY_300),
-        bgcolor=ft.Colors.GREY_50,
-        padding=6,
-    )
-    state.no_tiles.append({
-        "container": tile,
-        "label": title,
-        "light_img": light_img,
-        "batt_stack": batt_stack,
-        "temp_text": temp_text,
-    })
-    return tile
+        # タスク稼働フラグ
+        self.vdet_task_running = False
+        self.spi_task_running = False
 
+        # GPIO 初期化
+        self._init_gpio_base()
 
-def compute_outputs_from_on_flags(on_flags: list[bool]) -> tuple[int, int]:
-    # Map No.1..8 -> P00..P07; No.9..16 -> P10..P17
-    port0 = 0
-    port1 = 0
-    for i in range(8):
-        if on_flags[i]:
-            port0 |= (1 << i)  # P0i
-    for i in range(8):
-        if on_flags[8 + i]:
-            port1 |= (1 << i)  # P1i
-    return port0, port1
-
-
-def parse_user_memory(values: dict[int, int]) -> tuple[list[bool], list[int | None]]:
-    # Returns on_flags[16], temps[16]
-    # values keys: 0x22,0x24,0x26,0x28,0x2A,0x2C,0x2E,0x30,0x32 -> int
-    # If any required value missing, corresponding temp or on flag defaults to False/None.
-    def val(addr: int) -> int | None:
-        return values.get(addr, None)
-
-    A22, A24, A26, A28, A2A, A2C, A2E, A30, A32 = (
-        val(0x22), val(0x24), val(0x26), val(0x28), val(0x2A), val(0x2C), val(0x2E), val(0x30), val(0x32)
-    )
-    on = [False] * 16
-    t = [None] * 16
-
-    # No.1
-    if A22 is not None:
-        on[0] = bool(get_bit(A22, 15))
-        t[0] = get_bits(A22, 14, 7)
-    # No.2
-    if A22 is not None and A24 is not None:
-        on[1] = bool(get_bit(A22, 6))
-        t[1] = (get_bits(A22, 5, 0) << 2) | get_bits(A24, 15, 14)
-    # No.3
-    if A24 is not None:
-        on[2] = bool(get_bit(A24, 13))
-        t[2] = get_bits(A24, 12, 5)
-    # No.4
-    if A24 is not None and A26 is not None:
-        on[3] = bool(get_bit(A24, 4))
-        t[3] = (get_bits(A24, 3, 0) << 4) | get_bits(A26, 15, 12)
-    # No.5
-    if A26 is not None:
-        on[4] = bool(get_bit(A26, 11))
-        t[4] = get_bits(A26, 10, 3)
-    # No.6
-    if A26 is not None and A28 is not None:
-        on[5] = bool(get_bit(A26, 2))
-        t[5] = (get_bits(A26, 1, 0) << 6) | get_bits(A28, 15, 10)
-    # No.7
-    if A28 is not None:
-        on[6] = bool(get_bit(A28, 9))
-        t[6] = get_bits(A28, 8, 1)
-    # No.8
-    if A28 is not None and A2A is not None:
-        on[7] = bool(get_bit(A28, 0))
-        t[7] = get_bits(A2A, 15, 8)
-    # No.9
-    if A2A is not None and A2C is not None:
-        on[8] = bool(get_bit(A2A, 7))
-        t[8] = (get_bits(A2A, 6, 0) << 1) | get_bits(A2C, 15, 15)
-    # No.10
-    if A2C is not None:
-        on[9] = bool(get_bit(A2C, 14))
-        t[9] = get_bits(A2C, 13, 6)
-    # No.11
-    if A2C is not None and A2E is not None:
-        on[10] = bool(get_bit(A2C, 5))
-        t[10] = (get_bits(A2C, 4, 0) << 3) | get_bits(A2E, 15, 13)
-    # No.12
-    if A2E is not None:
-        on[11] = bool(get_bit(A2E, 12))
-        t[11] = get_bits(A2E, 11, 4)
-    # No.13
-    if A2E is not None and A30 is not None:
-        on[12] = bool(get_bit(A2E, 3))
-        t[12] = (get_bits(A2E, 2, 0) << 5) | get_bits(A30, 15, 11)
-    # No.14
-    if A30 is not None:
-        on[13] = bool(get_bit(A30, 10))
-        t[13] = get_bits(A30, 9, 2)
-    # No.15
-    if A30 is not None and A32 is not None:
-        on[14] = bool(get_bit(A30, 1))
-        t[14] = (get_bits(A30, 0, 0) << 7) | get_bits(A32, 15, 9)
-    # No.16
-    if A32 is not None:
-        on[15] = bool(get_bit(A32, 8))
-        t[15] = get_bits(A32, 7, 0)
-
-    return on, t
-
-
-async def vdet_polling_task(page: ft.Page, state: AppState):
-    # Poll GPIO4 every 500ms; manage GPIO15 according to spec and I2C init sequencing
-    prev_vdet = None
-    while state.vdet_task_running:
-        vdet = None
+    # ------------------------
+    # 画像読込み（base64）
+    # ------------------------
+    def _load_img_b64(self, path: str) -> str:
         try:
-            vdet = GPIO.input(GPIO4)
-            state.vdet_high = bool(vdet)
+            with open(path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
         except Exception as e:
-            print(f"[GPIO READ ERROR] GPIO4: {e}")
-            state.vdet_high = None
+            print(f"[ERROR] Image load failed: {path}: {e}")
+            traceback.print_exc()
+            # 不測時でもUIが壊れないよう空を返す
+            return ""
 
-        # Update VDET info text
-        if state.vdet_info_text:
-            if state.vdet_high is True:
-                state.vdet_info_text.value = "High"
-            elif state.vdet_high is False:
-                state.vdet_info_text.value = "Low"
-            else:
-                state.vdet_info_text.value = "-"
-
-        # Manage RESET (GPIO15)
+    # ------------------------
+    # GPIO 初期化（VDET/RESETのみ）
+    # ------------------------
+    def _init_gpio_base(self):
         try:
-            if state.vdet_high is True:
-                # If VDET is High and RESET is Low, release reset after 100ms
-                if state.reset_high is not True:
-                    await asyncio.sleep(0.1)
-                    GPIO.output(GPIO15, GPIO.HIGH)
-                    state.reset_high = True
-                    # After 100ms of High, start I2C init
-                    await asyncio.sleep(0.1)
-                    ok = state.i2c.init_pca9539()
-                    if state.i2c_info_text:
-                        if ok:
-                            state.i2c_info_text.value = "Succeeded."
-                            state.i2c_info_text.color = ft.Colors.GREEN
-                        else:
-                            state.i2c_info_text.value = "Waiting reset released..."
-                            state.i2c_info_text.color = ft.Colors.BLACK
-                else:
-                    # Already High; show status according to initialization
-                    if state.i2c_info_text:
-                        if state.i2c.initialized:
-                            state.i2c_info_text.value = "Succeeded."
-                            state.i2c_info_text.color = ft.Colors.GREEN
-                        else:
-                            state.i2c_info_text.value = "Waiting reset released..."
-                            state.i2c_info_text.color = ft.Colors.BLACK
-            elif state.vdet_high is False:
-                # Immediate RESET Low
-                GPIO.output(GPIO15, GPIO.LOW)
-                state.reset_high = False
-                state.i2c.initialized = False
-                if state.i2c_info_text:
-                    state.i2c_info_text.value = "Not initialized."
-                    state.i2c_info_text.color = ft.Colors.BLACK
-            else:
-                # Unknown state
-                if state.i2c_info_text:
-                    state.i2c_info_text.value = "Not initialized."
-                    state.i2c_info_text.color = ft.Colors.BLACK
+            GPIO.setmode(GPIO.BCM)
+            # VDET: 入力 + PUD_DOWN
+            GPIO.setup(GPIO_VDET, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+            # RESET: 出力 Low 初期化
+            GPIO.setup(GPIO_RESET, GPIO.OUT, initial=GPIO.LOW)
+            # SPI_EN(GPIO27)はSPI開始時にセットアップするのでここでは未設定
         except Exception as e:
-            print(f"[GPIO WRITE ERROR] GPIO15: {e}")
+            print(f"[ERROR] GPIO base init failed: {e}")
+            traceback.print_exc()
 
-        # Update RESET info text
-        if state.reset_info_text:
-            if state.reset_high is True:
-                state.reset_info_text.value = "High"
-            elif state.reset_high is False:
-                state.reset_info_text.value = "Low"
-            else:
-                state.reset_info_text.value = "-"
-
-        page.update()
-        await asyncio.sleep(0.5)
-
-
-async def spi_reader_task(page: ft.Page, state: AppState):
-    # SPI loop: every 500ms read USER memory and update UI + I2C outputs
-    try:
-        # Prepare GPIO27 and SPI controller
+    # ------------------------
+    # I2C 初期化（PCA9539）
+    # ------------------------
+    def i2c_init_and_verify(self) -> bool:
+        # GPIO15 High の100ms後に呼ばれる前提
         try:
-            GPIO.setup(GPIO27, GPIO.OUT, initial=GPIO.HIGH)
-            print("[GPIO] GPIO27 set as OUTPUT, set HIGH.")
-        except Exception as e:
-            print(f"[GPIO SETUP ERROR] GPIO27: {e}")
+            if self.bus is None:
+                self.bus = SMBus(I2C_BUS_NO)
 
+            # Configuration 0x06, 0x07 = 0x00（全出力）
+            self._i2c_write_byte(REG_CONFIG0, 0x00)
+            self._i2c_write_byte(REG_CONFIG1, 0x00)
+
+            # Polarity 0x04, 0x05 = 0x00（反転なし）
+            self._i2c_write_byte(REG_POLARITY0, 0x00)
+            self._i2c_write_byte(REG_POLARITY1, 0x00)
+
+            # Output 0x02, 0x03 = 0x00（全Low）
+            self._i2c_write_byte(REG_OUTPUT0, 0x00)
+            self._i2c_write_byte(REG_OUTPUT1, 0x00)
+            self.cached_out0 = 0x00
+            self.cached_out1 = 0x00
+
+            # 読み戻し確認（不一致時は1回再試行）
+            ok = True
+            ok &= (self._i2c_read_byte(REG_CONFIG0) == 0x00)
+            ok &= (self._i2c_read_byte(REG_CONFIG1) == 0x00)
+            ok &= (self._i2c_read_byte(REG_POLARITY0) == 0x00)
+            ok &= (self._i2c_read_byte(REG_POLARITY1) == 0x00)
+            ok &= (self._i2c_read_byte(REG_OUTPUT0) == 0x00)
+            ok &= (self._i2c_read_byte(REG_OUTPUT1) == 0x00)
+            if not ok:
+                print("[WARN] I2C verify failed, retrying once...")
+                # 再試行
+                self._i2c_write_byte(REG_CONFIG0, 0x00)
+                self._i2c_write_byte(REG_CONFIG1, 0x00)
+                self._i2c_write_byte(REG_POLARITY0, 0x00)
+                self._i2c_write_byte(REG_POLARITY1, 0x00)
+                self._i2c_write_byte(REG_OUTPUT0, 0x00)
+                self._i2c_write_byte(REG_OUTPUT1, 0x00)
+                ok = True
+                ok &= (self._i2c_read_byte(REG_CONFIG0) == 0x00)
+                ok &= (self._i2c_read_byte(REG_CONFIG1) == 0x00)
+                ok &= (self._i2c_read_byte(REG_POLARITY0) == 0x00)
+                ok &= (self._i2c_read_byte(REG_POLARITY1) == 0x00)
+                ok &= (self._i2c_read_byte(REG_OUTPUT0) == 0x00)
+                ok &= (self._i2c_read_byte(REG_OUTPUT1) == 0x00)
+            self.i2c_ready = ok
+            return ok
+        except Exception as e:
+            print(f"[ERROR] I2C init/verify failed: {e}")
+            traceback.print_exc()
+            self.i2c_ready = False
+            return False
+
+    def _i2c_write_byte(self, reg: int, value: int):
         try:
-            state.spi_ctrl = mr793200_controller(sclk_frequency=1_000_000)
+            if self.bus is None:
+                self.bus = SMBus(I2C_BUS_NO)
+            self.bus.write_byte_data(PCA9539_ADDR, reg, value & 0xFF)
         except Exception as e:
-            print(f"[SPI INIT ERROR] {e}")
-            state.spi_ctrl = None
+            print(f"[ERROR] I2C write failed: reg=0x{reg:02X}, val=0x{value:02X} err={e}")
+            traceback.print_exc()
+            raise
 
-        state.spi_running = True
-        state.spi_stop_requested = False
+    def _i2c_read_byte(self, reg: int) -> int:
+        try:
+            if self.bus is None:
+                self.bus = SMBus(I2C_BUS_NO)
+            return self.bus.read_byte_data(PCA9539_ADDR, reg) & 0xFF
+        except Exception as e:
+            print(f"[ERROR] I2C read failed: reg=0x{reg:02X} err={e}")
+            traceback.print_exc()
+            raise
 
-        # Loop
-        while state.spi_running and not state.spi_stop_requested:
-            # Read addresses: 0x22, 0x24, 0x26, 0x28, 0x2A, 0x2C, 0x2E, 0x30, 0x32
-            values: dict[int, int] = {}
-            if state.spi_ctrl is None:
-                print("[SPI] Controller not available.")
-            else:
-                for addr in [0x22, 0x24, 0x26, 0x28, 0x2A, 0x2C, 0x2E, 0x30, 0x32]:
-                    try:
-                        hexstr = state.spi_ctrl.read_nvm1(0x04, addr, 1)  # returns hex string e.g., "9a8a"
-                        val = int(hexstr, 16)
-                        values[addr] = val
-                    except Exception as e:
-                        print(f"[SPI READ ERROR] addr=0x{addr:02X}: {e}")
-                        values[addr] = None
+    def i2c_outputs_all_low(self):
+        # 終了処理の1) Output Port 0x02/0x03 に 0x00
+        try:
+            if self.bus is not None:
+                self._i2c_write_byte(REG_OUTPUT0, 0x00)
+                self._i2c_write_byte(REG_OUTPUT1, 0x00)
+                self.cached_out0 = 0x00
+                self.cached_out1 = 0x00
+        except Exception as e:
+            print(f"[ERROR] I2C outputs_all_low failed: {e}")
+            traceback.print_exc()
 
-            # Parse results
-            on_flags, temps = parse_user_memory(values)
-
-            # Update UI tiles
-            for i in range(16):
-                tile = state.no_tiles[i]
-                light_img: ft.Image = tile["light_img"]
-                temp_text: ft.Text = tile["temp_text"]
-                if on_flags[i]:
-                    light_img.src_base64 = state.img_light_on_b64
-                else:
-                    light_img.src_base64 = state.img_light_off_b64
-                if temps[i] is not None:
-                    temp_text.value = f"{temps[i]}°C"
-                else:
-                    temp_text.value = "-°C"
-
-            # I2C outputs update (mirror No.X On/Off)
+    def i2c_close(self):
+        if self.bus is not None:
             try:
-                if state.i2c.initialized:
-                    port0, port1 = compute_outputs_from_on_flags(on_flags)
-                    state.i2c.write_outputs(port0, port1)
+                self.bus.close()
             except Exception as e:
-                print(f"[I2C MIRROR ERROR] {e}")
+                print(f"[ERROR] I2C close failed: {e}")
+                traceback.print_exc()
+            self.bus = None
+        self.i2c_ready = False
 
-            page.update()
+    # ------------------------
+    # PCA9539 出力更新（No.1..16 に対応）
+    # ------------------------
+    def update_pca9539_outputs(self, on_states: List[int]):
+        # on_states: 16個の0/1
+        if not self.i2c_ready or self.bus is None:
+            return
+        try:
+            out0 = 0
+            out1 = 0
+            for i in range(8):
+                out0 |= ((1 if on_states[i] else 0) << i)
+            for i in range(8, 16):
+                out1 |= ((1 if on_states[i] else 0) << (i - 8))
+            if out0 != self.cached_out0:
+                self._i2c_write_byte(REG_OUTPUT0, out0)
+                self.cached_out0 = out0
+            if out1 != self.cached_out1:
+                self._i2c_write_byte(REG_OUTPUT1, out1)
+                self.cached_out1 = out1
+        except Exception as e:
+            print(f"[ERROR] update_pca9539_outputs failed: {e}")
+            traceback.print_exc()
+
+    # ------------------------
+    # VDET ポーリングタスク（500ms）
+    # ------------------------
+    async def vdet_poll_task(self):
+        self.vdet_task_running = True
+        try:
+            last_vdet = None
+            while self.app_running:
+                try:
+                    vdet = GPIO.input(GPIO_VDET)  # 0 or 1
+                except Exception as e:
+                    print(f"[ERROR] GPIO read VDET failed: {e}")
+                    traceback.print_exc()
+                    vdet = 0
+                # 変化時のRESET制御
+                if last_vdet is None or vdet != last_vdet:
+                    if vdet == 1:
+                        # High -> 100ms 後に RESET=High
+                        await asyncio.sleep(0.1)
+                        try:
+                            GPIO.output(GPIO_RESET, GPIO.HIGH)
+                        except Exception as e:
+                            print(f"[ERROR] GPIO set RESET High failed: {e}")
+                            traceback.print_exc()
+                        # さらに100ms後に I2C 初期化
+                        await asyncio.sleep(0.1)
+                        self.i2c_init_and_verify()
+                    else:
+                        # Low -> 即座に RESET=Low, I2C close
+                        try:
+                            GPIO.output(GPIO_RESET, GPIO.LOW)
+                        except Exception as e:
+                            print(f"[ERROR] GPIO set RESET Low failed: {e}")
+                            traceback.print_exc()
+                        self.i2c_close()
+                    last_vdet = vdet
+
+                # 情報表示更新
+                self._update_status_texts()
+                self.page.update()
+
+                await asyncio.sleep(0.5)
+        finally:
+            self.vdet_task_running = False
+
+    def _update_status_texts(self):
+        try:
+            vdet_val = GPIO.input(GPIO_VDET)
+            reset_val = GPIO.input(GPIO_RESET)
+            # VDET info
+            if vdet_val == 0:
+                self.vdet_info_text.value = "Low"
+            elif vdet_val == 1:
+                self.vdet_info_text.value = "High"
+            else:
+                self.vdet_info_text.value = "-"
+            # RESET info
+            if reset_val == 0:
+                self.reset_info_text.value = "Low"
+            elif reset_val == 1:
+                self.reset_info_text.value = "High"
+            else:
+                self.reset_info_text.value = "-"
+            # I2C Status info（要件通り GPIOの状態で表示を決定）
+            if vdet_val == 0 and reset_val == 0:
+                self.i2c_info_text.value = "Not initialized."
+                self.i2c_info_text.color = ft.Colors.BLACK
+            elif vdet_val == 1 and reset_val == 0:
+                self.i2c_info_text.value = "Waiting reset released..."
+                self.i2c_info_text.color = ft.Colors.BLACK
+            elif vdet_val == 1 and reset_val == 1:
+                self.i2c_info_text.value = "Succeeded."
+                self.i2c_info_text.color = ft.Colors.GREEN
+            else:
+                self.i2c_info_text.value = "-"
+                self.i2c_info_text.color = ft.Colors.BLACK
+        except Exception as e:
+            print(f"[ERROR] Update status texts failed: {e}")
+            traceback.print_exc()
+
+    # ------------------------
+    # SPI 読み取りタスク（500ms）
+    # ------------------------
+    async def spi_read_task(self):
+        self.spi_task_running = True
+        try:
+            while self.spi_running:
+                words = {}
+                try:
+                    for addr in USER_ADDRS:
+                        hexstr = self.mr.read_nvm1(0x04, addr, 1)
+                        # '9a8a' のような小文字hex
+                        words[addr] = int(hexstr, 16)
+                except Exception as e:
+                    print(f"[ERROR] SPI read failed: {e}")
+                    traceback.print_exc()
+                    # 継続して再試行
+                    await asyncio.sleep(0.5)
+                    continue
+
+                on_states, temps = self._parse_user_words(words)
+
+                # UI 更新
+                for i in range(16):
+                    # Light on/off
+                    img = self.cells[i]["light_img"]
+                    img.src_base64 = self.light_on_b64 if on_states[i] else self.light_off_b64
+                    # Temp text
+                    ttxt = self.cells[i]["temp_text"]
+                    ttxt.value = f"{temps[i]}°C" if temps[i] is not None else "-°C"
+                self.page.update()
+
+                # I2C 出力反映
+                self.update_pca9539_outputs(on_states)
+
+                await asyncio.sleep(0.5)
+        finally:
+            self.spi_task_running = False
+
+    # ------------------------
+    # USERメモリパース（On/Off と 温度）
+    # ------------------------
+    def _parse_user_words(self, words: Dict[int, int]) -> Tuple[List[int], List[int | None]]:
+        # words: {0x22: val, 0x24: val, ...}
+        on = [0] * 16
+        temp = [None] * 16
+
+        w22 = words.get(0x22, 0)
+        w24 = words.get(0x24, 0)
+        w26 = words.get(0x26, 0)
+        w28 = words.get(0x28, 0)
+        w2A = words.get(0x2A, 0)
+        w2C = words.get(0x2C, 0)
+        w2E = words.get(0x2E, 0)
+        w30 = words.get(0x30, 0)
+        w32 = words.get(0x32, 0)
+
+        # No.1
+        on[0] = (w22 >> 15) & 0x1
+        temp[0] = (w22 >> 7) & 0xFF
+
+        # No.2
+        on[1] = (w22 >> 6) & 0x1
+        temp[1] = ((w22 & 0x3F) << 2) | ((w24 >> 14) & 0x3)
+
+        # No.3
+        on[2] = (w24 >> 13) & 0x1
+        temp[2] = (w24 >> 5) & 0xFF
+
+        # No.4
+        on[3] = (w24 >> 4) & 0x1
+        temp[3] = ((w24 & 0xF) << 4) | ((w26 >> 12) & 0xF)
+
+        # No.5
+        on[4] = (w26 >> 11) & 0x1
+        temp[4] = (w26 >> 3) & 0xFF
+
+        # No.6
+        on[5] = (w26 >> 2) & 0x1
+        temp[5] = ((w26 & 0x3) << 6) | ((w28 >> 10) & 0x3F)
+
+        # No.7
+        on[6] = (w28 >> 9) & 0x1
+        temp[6] = (w28 >> 1) & 0xFF
+
+        # No.8
+        on[7] = (w28 >> 0) & 0x1
+        temp[7] = (w2A >> 8) & 0xFF
+
+        # No.9
+        on[8] = (w2A >> 7) & 0x1
+        temp[8] = ((w2A & 0x7F) << 1) | ((w2C >> 15) & 0x1)
+
+        # No.10
+        on[9] = (w2C >> 14) & 0x1
+        temp[9] = (w2C >> 6) & 0xFF
+
+        # No.11
+        on[10] = (w2C >> 5) & 0x1
+        temp[10] = ((w2C & 0x1F) << 3) | ((w2E >> 13) & 0x7)
+
+        # No.12
+        on[11] = (w2E >> 12) & 0x1
+        temp[11] = (w2E >> 4) & 0xFF
+
+        # No.13
+        on[12] = (w2E >> 3) & 0x1
+        temp[12] = ((w2E & 0x7) << 5) | ((w30 >> 11) & 0x1F)
+
+        # No.14
+        on[13] = (w30 >> 10) & 0x1
+        temp[13] = (w30 >> 2) & 0xFF
+
+        # No.15
+        on[14] = (w30 >> 1) & 0x1
+        temp[14] = ((w30 & 0x1) << 7) | ((w32 >> 9) & 0x7F)
+
+        # No.16
+        on[15] = (w32 >> 8) & 0x1
+        temp[15] = w32 & 0xFF
+
+        return on, temp
+
+    # ------------------------
+    # Play / Stop / Hot Reset
+    # ------------------------
+    def on_play(self, e):
+        # Play 押下：Play無効化、Stop有効化、SPI開始
+        if self.spi_running:
+            return
+        # UI
+        self.play_btn.disabled = True
+        self.stop_btn.disabled = False
+        self.page.update()
+
+        # SPI開始
+        try:
+            # GPIO27 設定・High
+            try:
+                GPIO.setup(GPIO_SPI_EN, GPIO.OUT, initial=GPIO.HIGH)
+            except Exception as ge:
+                print(f"[ERROR] GPIO27 setup failed: {ge}")
+                traceback.print_exc()
+            # MR793200 インスタンス生成
+            try:
+                self.mr = mr793200_controller(sclk_frequency=1_000_000)  # 1MHz
+            except Exception as se:
+                print(f"[ERROR] MR793200 init failed: {se}")
+                traceback.print_exc()
+                # 失敗時はボタン状態を元に戻す
+                self.play_btn.disabled = False
+                self.stop_btn.disabled = True
+                self.page.update()
+                return
+
+            self.spi_running = True
+            # SPI読み取りタスク開始
+            self.page.run_task(self.spi_read_task)
+
+        except Exception as e2:
+            print(f"[ERROR] SPI start failed: {e2}")
+            traceback.print_exc()
+            # UI戻す
+            self.play_btn.disabled = False
+            self.stop_btn.disabled = True
+            self.page.update()
+
+    def on_stop(self, e):
+        # Stop 押下：SPI通信の終了処理、UI/出力のリセット
+        self.stop_btn.disabled = True
+        self.page.update()
+        # SPI停止と終了処理
+        self._spi_cleanup()
+
+        # UI: 全Off & "-°C"、Light Off に戻す
+        for i in range(16):
+            self.cells[i]["light_img"].src_base64 = self.light_off_b64
+            self.cells[i]["temp_text"].value = "-°C"
+        self.page.update()
+
+        # PCA9539 を全Low
+        self.i2c_outputs_all_low()
+
+        # Play を再度有効化
+        self.play_btn.disabled = False
+        self.page.update()
+
+    def _spi_cleanup(self):
+        # 途中例外があっても指示された順序で終了:
+        # 1) GPIO27 に対し cleanup()
+        # 2) SPI ポート close()
+        try:
+            # 停止フラグ
+            self.spi_running = False
+
+            # タスクの自然終了を待つため少し猶予
+            # （run_taskのコルーチンが次のループで終了）
+            # ここでは同期的に待たずにクリーンアップ続行
+            pass
+        except Exception as e:
+            print(f"[ERROR] SPI stop flag set failed: {e}")
+            traceback.print_exc()
+        finally:
+            # GPIO27 cleanup
+            try:
+                GPIO.cleanup(GPIO_SPI_EN)
+            except Exception as e:
+                print(f"[ERROR] GPIO27 cleanup failed: {e}")
+                traceback.print_exc()
+
+            # SPI close
+            try:
+                if self.mr is not None and hasattr(self.mr, "spi") and self.mr.spi is not None:
+                    self.mr.spi.close()
+            except Exception as e:
+                print(f"[ERROR] SPI close failed: {e}")
+                traceback.print_exc()
+            self.mr = None
+
+    def on_hot_reset(self, e):
+        # Hot Reset ボタン: VDET Highなら RESETを500ms Low -> High -> 100ms後 I2C再初期化
+        self.hot_reset_msg.value = ""
+        self.page.update()
+
+        try:
+            vdet_val = GPIO.input(GPIO_VDET)
+        except Exception as ex:
+            print(f"[ERROR] GPIO read VDET in hot reset failed: {ex}")
+            traceback.print_exc()
+            vdet_val = 0
+
+        if vdet_val == 1:
+            # 非同期でリセット操作
+            self.page.run_task(self._hot_reset_sequence)
+        else:
+            # 利用不可メッセージ表示
+            self.hot_reset_msg.value = 'Available when VDET is "High."'
+            self.hot_reset_msg.color = ft.Colors.RED
+            self.page.update()
+
+    async def _hot_reset_sequence(self):
+        try:
+            GPIO.output(GPIO_RESET, GPIO.LOW)
             await asyncio.sleep(0.5)
+            GPIO.output(GPIO_RESET, GPIO.HIGH)
+            # 100ms 後 I2C 再初期化
+            await asyncio.sleep(0.1)
+            self.i2c_init_and_verify()
+        except Exception as e:
+            print(f"[ERROR] Hot reset sequence failed: {e}")
+            traceback.print_exc()
+        finally:
+            # メッセージは特に表示しない、必要なら状態は下段で反映
+            self._update_status_texts()
+            self.page.update()
 
-    except Exception as e:
-        print(f"[SPI TASK ERROR] {e}")
-    finally:
-        # SPI end processing even on exception:
+    # ------------------------
+    # UI 構築
+    # ------------------------
+    def build(self) -> ft.Column:
+        # Upper: Play / Stop
+        self.play_btn = ft.IconButton(
+            icon=ft.Icons.PLAY_CIRCLE_ROUNDED,
+            icon_color=ft.Colors.GREEN_ACCENT_400,
+            icon_size=36,
+            disabled=False,
+            tooltip="Start SPI reading",
+            on_click=self.on_play,
+        )
+        self.stop_btn = ft.IconButton(
+            icon=ft.Icons.STOP_CIRCLE_ROUNDED,
+            icon_color=ft.Colors.RED_400,
+            icon_size=36,
+            disabled=True,
+            tooltip="Stop SPI",
+            on_click=self.on_stop,
+        )
+        upper_row = ft.Row([self.play_btn, self.stop_btn], spacing=10)
+
+        upper_container = ft.Container(
+            content=upper_row,
+            padding=10,
+        )
+
+        # Middle: 2行 x 8列（GridViewは使わない）
+        self.cells = []
+        rows: List[ft.Row] = []
+        for r in range(2):
+            row_children = []
+            for c in range(8):
+                idx = r * 8 + c  # 0..15 -> No. idx+1
+                title = ft.Text(f"No. {idx+1}", size=14, weight=ft.FontWeight.W_600)
+                light_img = ft.Image(src_base64=self.light_off_b64, width=180, height=180)
+                temp_text = ft.Text("-°C", size=20, weight=ft.FontWeight.W_600, color=ft.Colors.BLACK)
+                battery_stack = ft.Stack(
+                    controls=[
+                        ft.Image(src_base64=self.battery_b64, width=180, height=180),
+                        ft.Container(content=temp_text, width=180, height=180, alignment=ft.alignment.center),
+                    ],
+                    width=180,
+                    height=180,
+                )
+                cell_col = ft.Column([title, light_img, battery_stack], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6)
+                cell_container = ft.Container(
+                    content=cell_col,
+                    padding=6,
+                    border=ft.border.all(1, ft.Colors.GREY_300),
+                    bgcolor=ft.Colors.GREY_50,
+                )
+                row_children.append(cell_container)
+                self.cells.append({"light_img": light_img, "temp_text": temp_text})
+            rows.append(ft.Row(row_children, spacing=8))
+        middle_container = ft.Column(rows, spacing=8, padding=10)
+
+        # Lower: ステータス領域
+        label_w = 160
+        info_w = 420
+        row_h = 40
+
+        def mk_label(text: str) -> ft.Container:
+            return ft.Container(
+                width=label_w,
+                height=row_h,
+                bgcolor=ft.Colors.GREY_300,
+                content=ft.Row([ft.Text(text, size=14, weight=ft.FontWeight.W_600)], alignment=ft.MainAxisAlignment.CENTER),
+                padding=0,
+            )
+
+        def mk_info(content: ft.Control) -> ft.Container:
+            return ft.Container(
+                width=info_w,
+                height=row_h,
+                bgcolor=ft.Colors.GREY_50,
+                content=ft.Row([content], alignment=ft.MainAxisAlignment.START),
+                padding=ft.padding.only(left=10),
+            )
+
+        i2c_row = ft.Row([mk_label("I2C Status"), mk_info(self.i2c_info_text)], spacing=0)
+        vdet_row = ft.Row([mk_label("VDET"), mk_info(self.vdet_info_text)], spacing=0)
+        reset_row = ft.Row([mk_label("RESET"), mk_info(self.reset_info_text)], spacing=0)
+
+        hot_reset_btn = ft.ElevatedButton("Hot Reset", on_click=self.on_hot_reset)
+        hot_reset_row = ft.Row(
+            [hot_reset_btn, ft.Container(width=10), self.hot_reset_msg],
+            spacing=0,
+            alignment=ft.MainAxisAlignment.START,
+        )
+
+        lower_container = ft.Container(
+            content=ft.Column([i2c_row, vdet_row, reset_row, hot_reset_row], spacing=8),
+            padding=10,
+        )
+
+        # ルート
+        root = ft.Column(
+            controls=[
+                upper_container,
+                ft.Divider(height=1, thickness=1),
+                middle_container,
+                ft.Divider(height=1, thickness=1),
+                lower_container,
+            ],
+            spacing=6,
+            expand=False,
+        )
+        return root
+
+    # ------------------------
+    # アプリ開始時のタスク起動
+    # ------------------------
+    def start_background_tasks(self):
+        # VDET ポーリング開始（500ms）
+        if not self.vdet_task_running:
+            self.page.run_task(self.vdet_poll_task)
+
+    # ------------------------
+    # アプリ終了処理
+    # ------------------------
+    def on_close(self, e=None):
+        # アプリの停止フラグ
+        self.app_running = False
+        # SPI 停止・終了処理
+        self._spi_cleanup()
+        # I2C 終了処理（1) 出力全Low -> 2) bus close）
+        self.i2c_outputs_all_low()
+        self.i2c_close()
+        # GPIO4/15 cleanup（個別指定）
         try:
-            GPIO.cleanup(GPIO27)
-            print("[GPIO] GPIO27 cleaned up.")
-        except Exception as e:
-            print(f"[GPIO CLEANUP ERROR] GPIO27: {e}")
-        try:
-            if state.spi_ctrl and hasattr(state.spi_ctrl, "spi") and state.spi_ctrl.spi:
-                state.spi_ctrl.spi.close()
-                print("[SPI] Port closed.")
-        except Exception as e:
-            print(f"[SPI CLOSE ERROR] {e}")
-        state.spi_running = False
-        state.spi_ctrl = None
+            # GPIO.cleanup([GPIO_VDET, GPIO_RESET])
+            GPIO.cleanup()
+        except Exception as ex:
+            print(f"[ERROR] GPIO cleanup for VDET/RESET failed: {ex}")
+            traceback.print_exc()
 
 
 def main(page: ft.Page):
-    page.title = "Battery Monitor (Raspberry Pi 4B)"
-    page.window_width = 1280
-    page.window_height = 900
-    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
-    page.vertical_alignment = ft.MainAxisAlignment.START
-    page.padding = 12
+    # デスクトップアプリ設定
+    page.title = "Battery Monitor (Raspberry Pi)"
+    page.window.maximized = True
+    page.padding = 10
+    page.bgcolor = ft.Colors.WHITE
 
-    state = AppState()
-    setup_gpio_initial()
-
-    # Upper container: Play / Stop
-    def on_play_click(e):
-        if state.play_btn.disabled:
-            return
-        # Deactivate Play; Activate Stop; start SPI
-        state.play_btn.disabled = True
-        state.stop_btn.disabled = False
-        page.update()
-        # Start SPI task
-        state.spi_stop_requested = False
-        page.run_task(spi_reader_task, page, state)
-
-    def on_stop_click(e):
-        if state.stop_btn.disabled:
-            return
-        # Deactivate Stop
-        state.stop_btn.disabled = True
-        # Request SPI stop
-        state.spi_stop_requested = True
-
-        # Reset tiles: all Off and temperature "-°C"; set light_off image
-        for i in range(16):
-            tile = state.no_tiles[i]
-            light_img: ft.Image = tile["light_img"]
-            temp_text: ft.Text = tile["temp_text"]
-            light_img.src_base64 = state.img_light_off_b64
-            temp_text.value = "-°C"
-
-        # I2C: set outputs Low (all Off)
-        try:
-            if state.i2c.initialized:
-                state.i2c.write_outputs(0x00, 0x00)
-        except Exception as e2:
-            print(f"[I2C RESET OUTPUTS ERROR] {e2}")
-
-        # Reactivate Play
-        state.play_btn.disabled = False
-        page.update()
-
-    play_btn = ft.IconButton(
-        icon=ft.Icons.PLAY_CIRCLE_ROUNDED,
-        icon_size=40,
-        tooltip="Play (Start SPI read)",
-        on_click=on_play_click,
-        disabled=False,
-        style=ft.ButtonStyle(color={"": ft.Colors.GREEN_ACCENT_400}),
-    )
-    stop_btn = ft.IconButton(
-        icon=ft.Icons.STOP_CIRCLE_ROUNDED,
-        icon_size=40,
-        tooltip="Stop (Stop SPI read)",
-        on_click=on_stop_click,
-        disabled=True,
-        style=ft.ButtonStyle(color={"": ft.Colors.RED_400}),
-    )
-    state.play_btn = play_btn
-    state.stop_btn = stop_btn
-    upper = ft.Container(content=ft.Row(controls=[play_btn, stop_btn], spacing=12))
-
-    # Middle container: 2 rows x 8 cols
-    row1_tiles = [build_no_tile(state, i + 1) for i in range(8)]
-    row2_tiles = [build_no_tile(state, i + 9) for i in range(8)]
-    middle = ft.Column(
-        controls=[
-            ft.Row(controls=row1_tiles, spacing=8, alignment=ft.MainAxisAlignment.CENTER),
-            ft.Row(controls=row2_tiles, spacing=8, alignment=ft.MainAxisAlignment.CENTER),
-        ],
-        spacing=8,
-    )
-
-    # Lower container: status panels and Hot Reset
-    # I2C Status + info
-    i2c_status_label = ft.Container(
-        content=ft.Row(controls=[ft.Text("I2C Status", weight=ft.FontWeight.BOLD)], alignment=ft.MainAxisAlignment.CENTER),
-        bgcolor=ft.Colors.GREY_300,
-        width=160,
-        height=40,
-        padding=0,
-    )
-    i2c_info_text = ft.Text("Not initialized.", color=ft.Colors.BLACK)
-    state.i2c_info_text = i2c_info_text
-    i2c_info_panel = ft.Container(
-        content=ft.Row(controls=[i2c_info_text], alignment=ft.MainAxisAlignment.CENTER),
-        bgcolor=ft.Colors.GREY_50,
-        width=400,
-        height=40,
-        padding=0,
-    )
-    i2c_row = ft.Row(controls=[i2c_status_label, i2c_info_panel], spacing=0)
-
-    # VDET + info
-    vdet_label = ft.Container(
-        content=ft.Row(controls=[ft.Text("VDET", weight=ft.FontWeight.BOLD)], alignment=ft.MainAxisAlignment.CENTER),
-        bgcolor=ft.Colors.GREY_300,
-        width=160,
-        height=40,
-        padding=0,
-    )
-    vdet_info_text = ft.Text("-", color=ft.Colors.BLACK)
-    state.vdet_info_text = vdet_info_text
-    vdet_info_panel = ft.Container(
-        content=ft.Row(controls=[vdet_info_text], alignment=ft.MainAxisAlignment.CENTER),
-        bgcolor=ft.Colors.GREY_50,
-        width=400,
-        height=40,
-        padding=0,
-    )
-    vdet_row = ft.Row(controls=[vdet_label, vdet_info_panel], spacing=0)
-
-    # RESET + info
-    reset_label = ft.Container(
-        content=ft.Row(controls=[ft.Text("RESET", weight=ft.FontWeight.BOLD)], alignment=ft.MainAxisAlignment.CENTER),
-        bgcolor=ft.Colors.GREY_300,
-        width=160,
-        height=40,
-        padding=0,
-    )
-    reset_info_text = ft.Text("-", color=ft.Colors.BLACK)
-    state.reset_info_text = reset_info_text
-    reset_info_panel = ft.Container(
-        content=ft.Row(controls=[reset_info_text], alignment=ft.MainAxisAlignment.CENTER),
-        bgcolor=ft.Colors.GREY_50,
-        width=400,
-        height=40,
-        padding=0,
-    )
-    reset_row = ft.Row(controls=[reset_label, reset_info_panel], spacing=0)
-
-    # Hot Reset row
-    def on_hot_reset(e):
-        warn_text = state.hot_reset_warn
-        if state.vdet_high is True:
-            # GPIO4 High -> perform hot reset: GPIO15 Low 500ms then High
-            try:
-                GPIO.output(GPIO15, GPIO.LOW)
-                state.reset_high = False
-                page.update()
-                time.sleep(0.5)  # 500ms
-                GPIO.output(GPIO15, GPIO.HIGH)
-                state.reset_high = True
-                # After 100ms, re-init I2C
-                time.sleep(0.1)
-                ok = state.i2c.init_pca9539()
-                if ok:
-                    state.i2c_info_text.value = "Succeeded."
-                    state.i2c_info_text.color = ft.Colors.GREEN
-                else:
-                    state.i2c_info_text.value = "Waiting reset released..."
-                    state.i2c_info_text.color = ft.Colors.BLACK
-                # Hide warning if shown
-                if warn_text:
-                    warn_text.value = ""
-            except Exception as e2:
-                print(f"[HOT RESET ERROR] {e2}")
-        else:
-            # GPIO4 Low -> show availability message, keep GPIO15 Low
-            try:
-                GPIO.output(GPIO15, GPIO.LOW)
-                state.reset_high = False
-            except Exception as e2:
-                print(f"[HOT RESET GPIO ERROR] {e2}")
-            if warn_text:
-                warn_text.value = 'Available when VDET is "High".'
-                warn_text.color = ft.Colors.RED
-        page.update()
-
-    hot_reset_btn = ft.FilledButton(text="Hot Reset", on_click=on_hot_reset)
-    hot_reset_warn = ft.Text("", color=ft.Colors.RED)
-    state.hot_reset_warn = hot_reset_warn
-    hot_reset_row = ft.Row(controls=[hot_reset_btn, hot_reset_warn], spacing=12, alignment=ft.MainAxisAlignment.START)
-
-    lower = ft.Column(controls=[i2c_row, vdet_row, reset_row, hot_reset_row], spacing=8)
-
-    # Build page
-    page.add(upper, ft.Divider(), middle, ft.Divider(), lower)
+    app = BatteryApp(page)
+    root = app.build()
+    page.add(root)
     page.update()
 
-    # Start VDET polling task
-    page.run_task(vdet_polling_task, page, state)
+    # ステータス初期更新
+    app._update_status_texts()
+    page.update()
 
-    # Close handling
-    def on_close(e):
-        print("[APP] Closing...")
-        # Stop tasks
-        state.vdet_task_running = False
-        state.spi_stop_requested = True
+    # 背景タスク開始
+    app.start_background_tasks()
 
-        # SPI end process if running
-        try:
-            # Cleanup GPIO27 and close SPI if the controller exists
-            GPIO.cleanup(GPIO27)
-            print("[GPIO] GPIO27 cleaned up (on close).")
-        except Exception as ex:
-            print(f"[GPIO CLEANUP ERROR] GPIO27 (on close): {ex}")
-        try:
-            if state.spi_ctrl and hasattr(state.spi_ctrl, "spi") and state.spi_ctrl.spi:
-                state.spi_ctrl.spi.close()
-                print("[SPI] Port closed (on close).")
-        except Exception as ex:
-            print(f"[SPI CLOSE ERROR] (on close): {ex}")
-
-        # I2C close
-        try:
-            state.i2c.close()
-        except Exception as ex:
-            print(f"[I2C CLOSE ERROR] (on close): {ex}")
-
-        # GPIO cleanup
-        gpio_cleanup_on_exit()
-
-    page.on_close = on_close
+    # アプリ終了時のクリーンアップ
+    page.on_close = app.on_close
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    # flet desktop
+    ft.app(target=main, view=ft.AppView.FLET_APP)
+
 
 # if __name__ == "__main__":
-#     # Desktop app
-#     ft.app(target=main, view=ft.AppView.FLET_APP)
+#     ft.app(target=main)
