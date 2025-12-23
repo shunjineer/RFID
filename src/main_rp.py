@@ -457,7 +457,7 @@ class BatteryApp:
                 except Exception as e:
                     print(f"[ERROR] SPI read failed: {e}")
                     traceback.print_exc()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.02)
                     continue
 
                 # on/off と温度配列に変換
@@ -475,7 +475,7 @@ class BatteryApp:
                 self.update_pca9539_outputs(on_states)
 
                 # 次周期まで待機
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.02)
         finally:
             self.spi_task_running = False
 
@@ -714,17 +714,17 @@ class BatteryApp:
         self.play_btn = ft.IconButton(
             icon=ft.Icons.PLAY_CIRCLE_ROUNDED,
             icon_color=ft.Colors.GREEN_ACCENT_400,  # 初期値: Activate（緑）
-            icon_size=36,
+            icon_size=54,
             disabled=False,
-            tooltip="Start SPI reading",
+            tooltip="Start battery monitoring",
             on_click=self.on_play,
         )
         self.stop_btn = ft.IconButton(
             icon=ft.Icons.STOP_CIRCLE_ROUNDED,
             icon_color=ft.Colors.GREY_300,          # 初期値: Deactivate（グレーアウト）
-            icon_size=36,
+            icon_size=54,
             disabled=True,
-            tooltip="Stop SPI",
+            tooltip="Stop battery monitoring",
             on_click=self.on_stop,
         )
         upper_row = ft.Row([self.play_btn, self.stop_btn], spacing=10)
@@ -737,16 +737,16 @@ class BatteryApp:
             row_children = []
             for c in range(8):
                 idx = r * 8 + c  # 0..15 -> No. idx+1
-                title = ft.Text(f"No. {idx+1}", size=14, weight=ft.FontWeight.W_600)
-                light_img = ft.Image(src_base64=self.light_off_b64, width=180, height=180)
+                title = ft.Text(f"No. {idx+1}", size=20, weight=ft.FontWeight.W_600)
+                light_img = ft.Image(src_base64=self.light_off_b64, width=120, height=120)
                 temp_text = ft.Text("-°C", size=20, weight=ft.FontWeight.W_600, color=ft.Colors.BLACK)
                 battery_stack = ft.Stack(
                     controls=[
-                        ft.Image(src_base64=self.battery_b64, width=180, height=180),
-                        ft.Container(content=temp_text, width=180, height=180, alignment=ft.alignment.center),
+                        ft.Image(src_base64=self.battery_b64, width=120, height=120),
+                        ft.Container(content=temp_text, width=120, height=120, alignment=ft.alignment.center),
                     ],
-                    width=180,
-                    height=180,
+                    width=120,
+                    height=120,
                 )
                 cell_col = ft.Column([title, light_img, battery_stack], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6)
                 cell_container = ft.Container(
@@ -754,11 +754,14 @@ class BatteryApp:
                     padding=6,
                     border=ft.border.all(1, ft.Colors.GREY_300),
                     bgcolor=ft.Colors.GREY_50,
+                    height=300,
+                    width=220,
+                    border_radius=10,
                 )
                 row_children.append(cell_container)
                 self.cells.append({"light_img": light_img, "temp_text": temp_text})
             rows.append(ft.Row(row_children, spacing=8))
-        middle_container = ft.Column(rows, spacing=8, padding=10)
+        middle_container = ft.Column(rows, spacing=8)
 
         # Lower: ステータス領域（ラベル＋情報表示）
         def mk_label(text: str) -> ft.Container:
