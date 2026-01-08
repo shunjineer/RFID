@@ -27,7 +27,7 @@ import RPi.GPIO as GPIO  # noqa: E402
 
 FAN_BAR_COUNT = 10
 FAN_BAR_MIN_H = 24
-FAN_BAR_MAX_H = 200
+FAN_BAR_MAX_H = 100
 
 SEAT_BAR_COUNT = 3
 SEAT_BAR_MIN_H = 18
@@ -47,6 +47,7 @@ SEAT_BAR_HEIGHTS = [
 
 # Fan bar 色（Seat OFF→LIGHT_BLUE、Seat ON→ORANGE）。右に行くほど濃く。
 FAN_LIGHT_BLUE_PALETTE = [
+    ft.Colors.LIGHT_BLUE_50,
     ft.Colors.LIGHT_BLUE_100,
     ft.Colors.LIGHT_BLUE_200,
     ft.Colors.LIGHT_BLUE_300,
@@ -56,7 +57,6 @@ FAN_LIGHT_BLUE_PALETTE = [
     ft.Colors.LIGHT_BLUE_700,
     ft.Colors.LIGHT_BLUE_800,
     ft.Colors.LIGHT_BLUE_900,
-    ft.Colors.BLUE_ACCENT_700,  # 少し強めに
 ]
 
 FAN_ORANGE_PALETTE = [
@@ -86,7 +86,7 @@ def make_fan_bars():
     for i in range(FAN_BAR_COUNT):
         bars.append(
             ft.Container(
-                width=14,
+                width=20,
                 height=FAN_BAR_HEIGHTS[i],
                 bgcolor=ft.Colors.GREY_300,
                 border_radius=4,
@@ -186,7 +186,8 @@ class MR793200Poller:
 
         # TID を 1回読み出し
         try:
-            tid_hex = self.controller.read_nvm1(0x04, 0x16, 6).upper()
+            tid_hex = self.controller.read_nvm4(0x04, 0x16, 6).upper()
+            print(tid_hex)
         except Exception:
             tid_hex = None
 
@@ -198,7 +199,7 @@ class MR793200Poller:
             try:
                 while not self.stop_event.is_set():
                     try:
-                        data_hex = self.controller.read_nvm1(0x04, 0x22, 2).upper()
+                        data_hex = self.controller.read_nvm4(0x04, 0x22, 2).upper()
                         # 期待長: 8 hex chars (2 words)
                         if not data_hex or len(data_hex) < 8:
                             raise ValueError("Invalid USER mem read length")
@@ -270,52 +271,57 @@ class MR793200Poller:
 
 def main(page: ft.Page):
     page.title = "MR793200 Driver Monitor"
-    page.window_width = 900
-    page.window_height = 700
+    # page.window.width = 1920
+    # page.window.height = 1080
+    page.window.maximized = True
     page.padding = 20
     page.theme_mode = ft.ThemeMode.LIGHT
 
     # 画像パス（/src/driver/main_rp.py からの相対パス）
-    fan_img_path = os.path.join("img", "fan_fill.png")
-    seat_img_path = os.path.join("img", "seat_heated_fill.png")
+    fan_img_path = os.path.join(SRC_DIR, "driver/img/fan_fill.png")
+    seat_img_path = os.path.join(SRC_DIR, "driver/img/seat_heated_fill.png")
 
     # 上部コンテナ: Play/Stop + TID
     play_btn = ft.IconButton(
         icon=ft.Icons.PLAY_CIRCLE_ROUNDED,
+        icon_size=54,
         icon_color=ft.Colors.GREEN_ACCENT_400,
-        tooltip="Start polling",
+        tooltip="Start seat sensing",
         disabled=False,  # 初期値: Activate
         on_click=None,   # 後でセット
     )
     stop_btn = ft.IconButton(
         icon=ft.Icons.STOP_CIRCLE_ROUNDED,
-        icon_color=ft.Colors.RED_400,
-        tooltip="Stop polling",
+        icon_size=54,
+        icon_color=ft.Colors.GREY_400,
+        tooltip="Stop seat sensing",
         disabled=True,  # 初期値: Deactivate（グレーアウト）
         on_click=None,  # 後でセット
     )
 
     tid_label = ft.Container(
-        content=ft.Text(value="TID", weight=ft.FontWeight.BOLD),
+        content=ft.Text(value="TID", size=20, weight=ft.FontWeight.W_600),
         bgcolor=ft.Colors.GREY_300,
-        padding=10,
-        alignment=ft.alignment.center_left,
-        width=120,
+        width=80,
+        height=40,
+        padding=ft.padding.only(left=20, top=5, bottom=5),
+        margin=0,
     )
-    tid_value_text = ft.Text(value="Can't Read TID.")
+    tid_value_text = ft.Text(value="Push start button.", size=20)
     tid_value = ft.Container(
         content=tid_value_text,
-        bgcolor=ft.Colors.GREY_50,
-        padding=10,
-        alignment=ft.alignment.center_left,
-        expand=False,
+        bgcolor=ft.Colors.BLUE_GREY_50,
+        width=500,
+        height=40,
+        padding=5,
+        margin=0,
     )
 
     upper_container = ft.Container(
         content=ft.Column(
             controls=[
                 ft.Row(controls=[play_btn, stop_btn], spacing=10),
-                ft.Row(controls=[tid_label, tid_value], spacing=10),
+                ft.Row(controls=[tid_label, tid_value], spacing=0),
             ],
             spacing=15,
         )
@@ -328,8 +334,9 @@ def main(page: ft.Page):
         fan_bars = make_fan_bars()
         fan_row = ft.Row(
             controls=[
-                ft.Image(src=fan_img_path, width=100, height=100),
-                ft.Row(controls=fan_bars, spacing=6, vertical_alignment=ft.CrossAxisAlignment.END),
+                ft.Container(width=60),
+                ft.Image(src=fan_img_path, width=50, height=50),
+                ft.Row(controls=fan_bars, spacing=10, vertical_alignment=ft.CrossAxisAlignment.END),
             ],
             spacing=10,
             vertical_alignment=ft.CrossAxisAlignment.END,  # 下ぞろえ
@@ -339,7 +346,8 @@ def main(page: ft.Page):
         seat_bars = make_seat_bars()
         seat_row = ft.Row(
             controls=[
-                ft.Image(src=seat_img_path, width=100, height=100),
+                ft.Container(width=60),
+                ft.Image(src=seat_img_path, width=50, height=50),
                 ft.Row(controls=seat_bars, spacing=10, vertical_alignment=ft.CrossAxisAlignment.END),
             ],
             spacing=10,
@@ -347,20 +355,37 @@ def main(page: ft.Page):
         )
 
         container = ft.Container(
-            bgcolor=ft.Colors.GREY_50,
+            bgcolor=ft.Colors.BLUE_GREY_50,
             border=ft.border.all(1, ft.Colors.GREY_300),
-            padding=10,
+            border_radius=10,
+            padding= ft.padding.only(left=100, right=100, top=10, bottom=10),
             content=ft.Column(
                 controls=[
-                    ft.Text(value=name, size=18, weight=ft.FontWeight.BOLD),
-                    ft.Text(value="Fan Speed", size=14),
+                    ft.Text(value=name, size=24, color=ft.Colors.GREY_700, weight=ft.FontWeight.BOLD),
+                    ft.Row(
+                        controls=[
+                            ft.Container(width=60),
+                            ft.Icon(ft.Icons.AIR, color=ft.Colors.LIGHT_BLUE_600),
+                            ft.Text(value="Fan Speed", size=16),
+                        ],
+                    ),
                     fan_row,
-                    ft.Divider(),
-                    ft.Text(value="Seat Heater", size=14),
+                    ft.Divider(height=50, thickness=0.5),
+                    ft.Row(
+                        controls=[
+                            ft.Container(width=60),
+                            ft.Icon(ft.Icons.WAVES, color=ft.Colors.ORANGE_400),
+                            ft.Text(value="Seat Heater", size=16),
+                        ],
+                    ),
+                    ft.Container(height=10),
                     seat_row,
                 ],
                 spacing=8,
+                # alignment=ft.Alignment(0.0, 0.0)
             ),
+            width=700,
+            height=380,
         )
 
         seat_controls[name] = {
@@ -401,7 +426,7 @@ def main(page: ft.Page):
 
         if msg.get("type") == "tid":
             tid_hex = msg.get("value")
-            tid_value_text.value = tid_hex if tid_hex else "Can't Read TID."
+            tid_value_text.value = tid_hex if tid_hex else "Push start button."
             page.update()
             return
 
@@ -425,7 +450,9 @@ def main(page: ft.Page):
     def on_play_click(e):
         # UI: Play→Deactivate, Stop→Activate
         play_btn.disabled = True
+        play_btn.icon_color = ft.Colors.GREY_400
         stop_btn.disabled = False
+        stop_btn.icon_color = ft.Colors.RED
         page.update()
 
         # 通信開始（UI更新は pubsub 経由で行う。page.update() はメインスレッドのみ）
@@ -434,6 +461,9 @@ def main(page: ft.Page):
     def on_stop_click(e):
         # UI: Stop→Deactivate
         stop_btn.disabled = True
+        stop_btn.icon_color = ft.Colors.GREY_400
+        play_btn.disabled = False
+        play_btn.icon_color = ft.Colors.GREEN_ACCENT_400
         page.update()
 
         # 終了処理（例外有無に関わらず cleanup→SPI close）
@@ -441,7 +471,7 @@ def main(page: ft.Page):
 
         # UI: バーをオフ、TID クリア、Play→Activate
         off_all_bars(seat_controls)
-        tid_value_text.value = "Can't Read TID."
+        tid_value_text.value = "Push start button."
         play_btn.disabled = False
         page.update()
 
