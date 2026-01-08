@@ -1,19 +1,60 @@
-```
-pi@raspberrypi:~/RFID $ uv run flet run src/battery/main_rp.py
+推定原因は read_nvm1() の「ダミーバイト数」と「受信バイト抽出インデックス」の不整合です。
 
-(flet:8276): Atk-CRITICAL **: 19:21:04.116: atk_socket_embed: assertion 'plug_id != NULL' failed
-/home/pi/RFID/src/battery/main_rp.py:121: RuntimeWarning: This channel is already in use, continuing anyway.  Use GPIO.setwarnings(False) to disable warnings.
-  GPIO.setup(GPIO_RESET, GPIO.OUT, initial=GPIO.LOW)
-/home/pi/RFID/src/battery/main_rp.py:446: RuntimeWarning: This channel is already in use, continuing anyway.  Use GPIO.setwarnings(False) to disable warnings.
-  GPIO.setup(GPIO_SPI_EN, GPIO.OUT, initial=GPIO.HIGH)
-sclk_frequency = 1.0 MHz
-[ERROR] SPI start failed: 'BatteryApp' object has no attribute 'spi_read_task'
-Traceback (most recent call last):
-  File "/home/pi/RFID/src/battery/main_rp.py", line 464, in on_play
-    self.page.run_task(self.spi_read_task)
-                       ^^^^^^^^^^^^^^^^^^
-AttributeError: 'BatteryApp' object has no attribute 'spi_read_task'
-embedder.cc (2519): 'FlutterEngineRemoveView' returned 'kInvalidArguments'. Remove view info was invalid. The implicit view cannot be removed.
+現状コードの動き
+- 送信バイト数: ヘッダ4バイト + ダミー(0x00)を word_len*2 バイト
+- 受信データは同長で返り、先頭2バイトを捨てて read_data = resp[2:] としています。
+- その後、各ワードのデータを
+  read_data[2*(2*i+1):2*(2*i+1)+2] で拾っています。
+  これは iごとに 2, 6, 10, 14, 18, 22… の位置から2バイトずつ抜くという意味です（4バイト間隔）。
 
-** (flet:8276): WARNING **: 19:21:17.513: Attempted to set message handler on an FlBinaryMessenger without an engine
+このインデックスは「各ワードが4バイト（例: 2バイトのステータス＋2バイトのデータ）」で返る前提の取り方です。しかし送っているダミーは「各ワード2バイト」しか無いため、返ってくる総バイト数が足りず、インデックスが配列末尾を超えます。その結果、word_len=6 の場合でも実際に抜けるのは最初の3組（2,6,10の位置）だけになり、「6ワード指定なのに3ワード分しか得られない」という現象になります。
+
+数式で確認
+- 総送信＝4 + 2*word_len → 返り＝同長
+- 先頭2バイトを捨てるので read_data 長さ L = 2 + 2*word_len
+- 取り出し終端インデックスは 2*(2*i+1)+2 = 4*i+4
+- 取り出せる条件は 4*i+4 <= L → 4*i <= 2*word_len - 2 → i <= word_len/2 - 0.5
+- つまり取り出せる本数は floor(word_len/2 + 0.5) = ceil(word_len/2)
+- word_len=6 → ceil(6/2)=3 本しか取れません。
+
+想定される修正方針
+1) 各ワードが「ステータス2バイト＋データ2バイト」の計4バイト返る仕様なら、ダミーバイトを word_len*4 に増やし、取り出しロジックを維持する。
+2) もし「先頭のヘッダを除いたら、その後は純粋に各ワード2バイトが連続して返る」仕様なら、先頭4バイトを捨てて（resp[4:]）、単純に word_len*2 バイトを切り出す。
+
+どちらが正しいかは MR793200 のデータシートの SPI トランザクション図（READ_NVM の返りフォーマット）で確認してください。一般的には NVM/EEPROM 読み出しで「ステータスやダミーがワードごとに入る」タイプと「最初だけステータス、以降は連続データ」のタイプが存在します。
+
+修正例（各ワードが4バイト返る想定）
 ```
+def read_nvm1(self, addr_msb, addr_lsb, word_len):
+    # 2ステータス + 2データ をワードごとに返す前提でダミーを4*word_len発行
+    tx = [READ_NVM1 | addr_msb, addr_lsb, 0x00, 0x00] + [0x00] * (word_len * 4)
+    resp = self.spi.xfer2(tx)
+
+    # 先頭4バイト（コマンド/アドレス応答）を捨てる
+    payload = resp[4:]
+
+    data_bytes = []
+    for i in range(word_len):
+        base = i * 4
+        # ワード内の後半2バイトが実データ（big-endian想定）
+        data_bytes.extend(payload[base + 2 : base + 4])
+
+    return bytearray(data_bytes).hex()
+```
+
+修正例（先頭のヘッダ後は連続データが2バイト/ワードで返る想定）
+```
+def read_nvm1(self, addr_msb, addr_lsb, word_len):
+    tx = [READ_NVM1 | addr_msb, addr_lsb, 0x00, 0x00] + [0x00] * (word_len * 2)
+    resp = self.spi.xfer2(tx)
+
+    # 先頭4バイトを捨て、続く word_len*2 バイトがデータ
+    data = resp[4 : 4 + word_len * 2]
+    return bytearray(data).hex()
+```
+
+どちらかを選んで実機で word_len=6 の TID リードを試し、戻りのバイト長が 12 バイト（16進文字列長24文字）になっているか確認すると、原因切り分けできます。
+
+補足
+- 現在の [2:] という先頭削りは、ヘッダが2バイトである前提ですが、一般的にはコマンド＋アドレスの応答で最初の4バイト分はデータではない場合が多いです。ここも 4 に見直す可能性が高いです。
+- 返りのエンディアン（ワード内の上位・下位バイトの並び）はデータシート準拠で調整してください。
