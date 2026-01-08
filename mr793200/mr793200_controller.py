@@ -1,5 +1,6 @@
 import spidev
 import time
+import RPi.GPIO as GPIO
 
 READ = (0x09 << 4)
 WRITE = (0x0D << 4)
@@ -47,13 +48,61 @@ class mr793200_controller():
     def write_nvm_user_memory(self, addr_offset, data):
         self.write_nvm(0x04, 0x22 + addr_offset, data)
 
+    def read_nvm4(self, addr_msb, addr_lsb, word_len):
+        # 先頭4バイト: コマンド/アドレス/ダミー
+        # 以降、各ワードは [DATA(2B), STATUS(2B)] の4バイトで返る前提
+        tx = [READ_NVM1 | addr_msb, addr_lsb, 0x00, 0x00] + [0x00] * (word_len * 4)
+        resp = self.spi.xfer2(tx)
+
+        if len(resp) < 4 + word_len * 4:
+            raise IOError(f"SPI response too short: {len(resp)} bytes")
+
+        payload = resp[4:]  # ヘッダ4バイトを捨てる
+
+        data_bytes = []
+        for i in range(word_len):
+            base = i * 4
+            # 各4バイトブロックの先頭2バイトがデータ（ビッグエンディアン想定）
+            data_bytes.extend(payload[base : base + 2])
+
+        return bytearray(data_bytes).hex().upper()
+
 # Test
 if __name__ == '__main__':
+    # mr793200 = mr793200_controller()
+    # print(f"read_model_number = {mr793200.read_model_number()}")
+    # mr793200.enable_write_nvm()
+    # mr793200.write_nvm_user_memory(0, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12,])
+    # print(f"USER memoey = {mr793200.read_nvm_user_memory(18)}")
+    # mr793200.write_nvm_user_memory(0, [0x00]*18)
+    # print(f"USER memoey = {mr793200.read_nvm_user_memory(18)}")
+
+    # PSEL = High test #
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(27, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.output(27, GPIO.HIGH)
+    time.sleep(1)
+
+
     mr793200 = mr793200_controller()
-    print(f"read_model_number = {mr793200.read_model_number()}")
-    mr793200.enable_write_nvm()
-    mr793200.write_nvm_user_memory(0, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12,])
-    print(f"USER memoey = {mr793200.read_nvm_user_memory(18)}")
-    mr793200.write_nvm_user_memory(0, [0x00]*18)
-    print(f"USER memoey = {mr793200.read_nvm_user_memory(18)}")
+
+    # for addr in range(0x22, 0x33, 2):
+    #     user_mem = mr793200.read_nvm1(0x04, addr, 1)
+    #     if isinstance(user_mem, (bytes, bytearray)):
+    #         b0, b1 = user_mem[0], user_mem[1]
+    #     else:
+    #         val = int(user_mem)
+    #         b0, b1 = (val >> 8) & 0xFF, val & 0xFF
+    #     print(f"0x{addr:02X}", f"0x{b0:02X}", f"0x{b1:02X}")
+
+    # print(mr793200.read_model_number())
+
+    user_mem_1 = mr793200.read_nvm4(0x04, 0x16, 1)
+    user_mem_2 = mr793200.read_nvm4(0x04, 0x18, 1)
+    user_mem_3 = mr793200.read_nvm4(0x04, 0x1A, 1)
+    user_mem_4 = mr793200.read_nvm4(0x04, 0x1C, 1)
+    print(user_mem_1+"\n", user_mem_2+"\n", user_mem_3+"\n", user_mem_4)
+
+    GPIO.output(27, GPIO.LOW)
+    GPIO.cleanup()
 
