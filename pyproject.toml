@@ -1,0 +1,12 @@
+[project]
+name = "rfid"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flet[all]==0.28.3",
+    "pyserial~=3.5",
+    "pillow~=12.0",
+]
+
